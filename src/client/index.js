@@ -197,6 +197,109 @@ function annotationDraftOf(doc, id) {
   return node.title === undefined || node.title === null ? '' : String(node.title)
 }
 
+/**
+ * `maybeDescendantId` 是否在 `ancestorId` 的子树里（含自身）。
+ * 带 guard 集合，即使数据被写坏成环也会终止。
+ *
+ * ⚠️ 这是 `src/overlay/index.js` 里同名函数的**逐字副本**（防漂移断言盯着）。
+ */
+function isDescendant(doc, ancestorId, maybeDescendantId) {
+  let cursor = maybeDescendantId
+  const guard = new Set()
+  while (cursor && !guard.has(cursor)) {
+    if (cursor === ancestorId) return true
+    guard.add(cursor)
+    cursor = doc.nodes[cursor]?.parentId ?? null
+  }
+  return false
+}
+
+/**
+ * 改父是否合法：自指、指向不存在的节点、成环，三种都拒绝。
+ *
+ * ⚠️ 这是 `src/overlay/index.js` 里同名函数的**逐字副本**（防漂移断言盯着）。
+ * 客户端必须有一份**真的**防环实现 —— 「新建子节点」用它校验父，
+ * 以后「拉线改父」（阶段 3）也用它。少了它，`opCreateManual` 的
+ * `deps.canSetParent` 就没有可用的实现。
+ */
+function canSetParent(doc, childId, parentId) {
+  if (!doc.nodes[childId]) return { ok: false, reason: 'missing-child' }
+  if (parentId === null) return { ok: true }
+  if (childId === parentId) return { ok: false, reason: 'self' }
+  if (!doc.nodes[parentId]) return { ok: false, reason: 'missing-parent' }
+  if (isDescendant(doc, childId, parentId)) return { ok: false, reason: 'cycle' }
+  return { ok: true }
+}
+
+/**
+ * `canSetParent` 的宽松版：允许 `parentId` 为 null/undefined（= 变成顶层），
+ * 其余交给传进来的那份唯一实现 —— **不重复实现防环**。
+ *
+ * ⚠️ 这是 `src/overlay/manual.js` 里同名函数的**逐字副本**（防漂移断言盯着）。
+ *
+ * @param {(doc: any, childId: string, parentId: string) => { ok: boolean, reason?: string }} canSetParent
+ */
+function canSetParentLoose(canSetParent, doc, parentId, childId) {
+  if (parentId === null || parentId === undefined) {
+    return childId === undefined || doc.nodes[childId] ? { ok: true } : { ok: false, reason: 'missing-child' }
+  }
+  if (childId === undefined) {
+    // 建节点时校验父是否存在（此时还没有子）
+    return doc.nodes[parentId] ? { ok: true } : { ok: false, reason: 'missing-parent' }
+  }
+  return canSetParent(doc, childId, parentId)
+}
+
+/**
+ * 新建一个**手建子节点**（父 = `input.parentId`）。
+ *
+ * 防环：建节点时只校验父是否存在（新节点还没有子，不可能成环）。
+ * 真正会让环出现的是**改父**，那条路由 `opSetParent` + `canSetParent` 守着。
+ *
+ * ⚠️ 这是 `src/overlay/manual.js` 里同名函数的**逐字副本**（防漂移断言盯着）。
+ * 为什么"零依赖"很重要：早先它在 `undo.js` 里，会连带 `canSetParentLoose`
+ * 与 `setCanSetParent` 的注入接线 —— 客户端就得抄三样、三处都可能分叉。
+ *
+ * @param {object} doc
+ * @param {{ parentId?: string | null, position?: { x: number, y: number }, title?: string }} input
+ * @param {{ newId?: () => string }} [deps] 注入 id 生成器，便于测试确定化
+ */
+function opCreateManual(doc, input, deps = {}) {
+  // ⚠️ 这里**不能**把默认值写成 `deps.canSetParent || canSetParent`：
+  // 同一个作用域里 `const canSetParent` 会遮蔽外层那个函数，于是 `|| canSetParent`
+  // 读到的是**还没初始化的自己** —— TDZ 报错 `Cannot access 'canSetParent' before initialization`。
+  // 真机上就是这么炸的（点「＋」没有任何反应，只有 console 里一条异常）。
+  // 用一个**不同名**的常量兜住，语义不变、也不会遮蔽任何东西。
+  const canSetParentFn = deps.canSetParent || canSetParent
+  const can = doc.nodes[input.parentId] === undefined && input.parentId !== null && input.parentId !== undefined
+    ? { ok: false, reason: 'missing-parent' }
+    : canSetParentLoose(canSetParentFn, doc, input.parentId)
+  if (!can.ok) return { ok: false, reason: can.reason, doc }
+
+  const newId = deps.newId || newManualId
+  const id = newId()
+  const node = {
+    id,
+    kind: 'manual',
+    parentId: input.parentId ?? null,
+    position: input.position ? { ...input.position } : { x: 40, y: 40 },
+  }
+  if (input.title !== undefined) node.title = input.title
+  const next = { ...doc, nodes: { ...doc.nodes, [id]: node } }
+  return { ok: true, doc: next, id, op: { type: 'create', id } }
+}
+
+/**
+ * 造一个手建节点的 id（前缀 `M`；投影节点是 `T`）。
+ *
+ * 为什么不用纯随机：同一会话里历史节点越多，纯随机的碰撞面越大，
+ * 而一旦撞上，`{ ...doc.nodes, [id]: node }` 会**静默覆盖**掉一个已有节点。
+ * 带时间戳把碰撞面压到「同一毫秒内建两个」，随机段再兜住它。
+ */
+function newManualId() {
+  return 'M' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+}
+
 function createPlugin(React) {
   const h = React.createElement
   const { useCallback, useEffect, useRef, useState } = React
@@ -456,6 +559,21 @@ function createPlugin(React) {
   opacity: 0;
 }
 [${ROOT_ATTR}] .ftm-chain-row:hover .ftm-chain-jump { opacity: 1; }
+[${ROOT_ATTR}] .ftm-chain-add {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.9em;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--dsw-alias-border-1, rgba(128, 128, 128, 0.35));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0;
+}
+[${ROOT_ATTR}] .ftm-chain-row:hover .ftm-chain-add,
+[${ROOT_ATTR}] .ftm-chain-add:focus-visible { opacity: 1; }
 [${ROOT_ATTR}] .ftm-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
 [${ROOT_ATTR}] .ftm-tools .ftm-btn { flex: 0 0 auto; }
 [${ROOT_ATTR}] .ftm-help {
@@ -1130,8 +1248,38 @@ function createPlugin(React) {
         setAnnotating(null)
       }
 
-      const onJumpToBubble = (row) => {
-        // 作用域给 document：气泡在官方对话列里，不在我们面板内
+      /**
+       * 新建手建子节点（画布计划 §8 的阶段 1 第 2 项）。
+       *
+       * 交互：每行右侧「＋ 子节点」→ 在该行下建一个 `kind: 'manual'` 的节点，
+       * 并把焦点移过去（与面板点击同一条 `save` 路径）。
+       *
+       * 三条要点：
+       *   1. **防环**：`opCreateManual` 用 `canSetParentLoose` → `canSetParent` 校验父。
+       *      建节点时新节点还没有子，不可能成环；真正会成环的是**改父**（阶段 3 拉线）。
+       *   2. **位置**：子节点放在父的右下方。父没位置（还没拖过）就用默认点。
+       *      这里只是给个不重叠的初值，阶段 3 会按几何重排。
+       *   3. **焦点跟随**：建完把 `focusId` 指到新节点 —— 用户刚建的东西就该是当前焦点。
+       */
+      const onCreateChild = (row) => {
+        const doc = authority.doc
+        if (!doc) return
+        const parent = doc.nodes[row.id]
+        const pos = parent && parent.position ? parent.position : { x: 40, y: 40 }
+        const r = opCreateManual(doc, {
+          parentId: row.id,
+          position: { x: pos.x + 40, y: pos.y + 40 },
+        })
+        if (!r.ok) {
+          setAuthority((s) => ({ ...s, notice: '新建子节点失败：' + (r.reason || '未知原因') }))
+          return
+        }
+        setHighlightId(r.id)
+        setAuthority((s) => ({ ...s, notice: '' }))
+        saveAuthority({ ...r.doc, focusId: r.id }, { kind: 'focus', nodeId: r.id })
+      }
+
+      const onJumpToBubble = (row) => {        // 作用域给 document：气泡在官方对话列里，不在我们面板内
         const r = scrollToBubble(document, row)
         if (r.ok) {
           setJumpNotice({ tone: 'ok', text: '已跳到对应气泡' })
@@ -1228,6 +1376,19 @@ function createPlugin(React) {
                         // 注解是空串时**显示空**，用一个占位符表明"用户主动清空了"
                         row.title === '' ? (row.hasAnnotation ? '（已清空）' : '（无标题）') : row.title,
                       ),
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'ftm-chain-add',
+                    'data-ftm-add-child': row.id,
+                    title: '在这个节点下面新建一个子节点',
+                    onClick: (e) => {
+                      e.stopPropagation()
+                      onCreateChild(row)
+                    },
+                  },
+                  '＋',
                 ),
                 row.sourceRef
                   ? h(

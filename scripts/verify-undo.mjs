@@ -62,6 +62,53 @@ function fixture() {
 
 // ───────────────────────────── 手建 ─────────────────────────────
 
+// 阶段 1 第 2 项（每行「＋ 新建子节点」）落地时新增的两条：
+// `opCreateManual` 的实现从 `undo.js` 迁到了 `overlay/manual.js`（客户端要逐字复制它，
+// 而它原先连着 `canSetParentLoose` 与注入接线，抄一份要抄三样）。迁完要保证：
+//   1. 在**深层**父上建节点，结果仍然是一份**合法**的 overlay（父链不断、能过校验）；
+//   2. 新节点 id 在已有节点里**不重复**（覆盖会让一个已有节点凭空消失）。
+
+test('手建：在深层父上建节点 → 结果仍是合法 overlay（validateOverlay 通过）', () => {
+  const doc = fixture()
+  let cur = doc
+  let parentId = 'B' // 已经是第 3 层
+  for (let i = 0; i < 5; i += 1) {
+    const r = opCreateManual(cur, { parentId, position: { x: i * 10, y: i * 10 } }, { newId })
+    assert.equal(r.ok, true, '第 ' + (i + 1) + ' 层应当建成功')
+    cur = r.doc
+    parentId = r.id
+  }
+  const v = validateOverlay(cur)
+  assert.equal(v.ok, true, '深层建完必须仍合法：' + JSON.stringify(v.errors).slice(0, 200))
+  // 父链从最深一路走回顶层，不该断
+  let cursor = parentId
+  let hops = 0
+  while (cursor) {
+    assert.ok(cur.nodes[cursor], '父链上的节点必须存在：' + cursor)
+    cursor = cur.nodes[cursor].parentId
+    hops += 1
+    assert.ok(hops < 50, '父链不该成环')
+  }
+  assert.equal(hops, 8, 'B → 新建 5 层 → 再回到 R/A 共 8 跳')
+})
+
+test('手建：默认 id 生成器在**同一毫秒**连建多个也不撞已有节点', () => {
+  const doc = fixture()
+  let cur = doc
+  const ids = new Set(Object.keys(doc.nodes))
+  // 不注入 newId ⇒ 用生产的那份默认生成器（时间戳 + 随机段）
+  for (let i = 0; i < 40; i += 1) {
+    const r = opCreateManual(cur, { parentId: 'R' })
+    assert.equal(r.ok, true)
+    assert.equal(ids.has(r.id), false, '新 id 撞了已有节点：' + r.id)
+    assert.equal(/^M/.test(r.id), true, '手建节点 id 应当以 M 开头：' + r.id)
+    ids.add(r.id)
+    cur = r.doc
+  }
+  // 建了 40 个 + 原有 4 个 ⇒ 节点数必须是 44（撞了就会少）
+  assert.equal(Object.keys(cur.nodes).length, 44, 'id 碰撞会让节点数变少')
+})
+
 test('手建：新建 manual 节点，带 op 描述', () => {
   const doc = fixture()
   const r = opCreateManual(doc, { parentId: 'R', position: { x: 10, y: 20 } }, { newId })

@@ -21,6 +21,12 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/**
+ * `opCreateManual` 的实现在这里（同一份，不是副本）；
+ * `canSetParentLoose` 是共用的「宽松包装」，环逻辑因此只有一处。
+ */
+import { canSetParentLoose as canSetParentLooseShared, opCreateManual } from './manual.js'
+
 /** 用户历史栈深（规格 §7）。 */
 export const HISTORY_DEPTH = 50
 
@@ -472,25 +478,17 @@ export class HistoryBySession {
 
 // ───────────────────────────── 用户操作（都在这里产 op 描述） ─────────────────────────────
 
-/** 手建节点。`parentId` 走 `canSetParent` 校验。 */
-export function opCreateManual(doc, input, deps = {}) {
-  const can = doc.nodes[input.parentId] === undefined && input.parentId !== null && input.parentId !== undefined
-    ? { ok: false, reason: 'missing-parent' }
-    : canSetParentLoose(doc, input.parentId)
-  if (!can.ok) return { ok: false, reason: can.reason, doc }
-
-  const newId = deps.newId || (() => 'M' + Math.random().toString(36).slice(2, 10))
-  const id = newId()
-  const node = {
-    id,
-    kind: 'manual',
-    parentId: input.parentId ?? null,
-    position: input.position ? { ...input.position } : { x: 40, y: 40 },
-  }
-  if (input.title !== undefined) node.title = input.title
-  const next = { ...doc, nodes: { ...doc.nodes, [id]: node } }
-  return { ok: true, doc: next, id, op: { type: OP_CREATE, id } }
-}
+/**
+ * 手建节点 —— **实现已迁到 `overlay/manual.js`**，这里只重新导出。
+ *
+ * 为什么迁走：客户端不能 import 相对模块，要用它就得逐字复制；
+ * 而它会连带 `canSetParentLoose`（后者依赖 `setCanSetParent` 的注入接线）。
+ * 留在 undo.js 意味着客户端得抄「函数 + 私有依赖 + 注入接线」三样，
+ * 三处都可能分叉。迁到 `manual.js`（零依赖纯函数模块）后**只需要抄一个函数**。
+ *
+ * 重新导出保证现有调用方（宿主、测试）不用改，也不会出现两份实现。
+ */
+export { opCreateManual }
 
 /** 手动改父（Tree 边）。成环/自指/缺节点一律拒绝，**不改动 doc**。 */
 export function opSetParent(doc, childId, parentId) {
@@ -615,15 +613,14 @@ export function opGeometry(doc, id, geometry) {
  * `canSetParent` 的宽松版：允许 `parentId` 为 null/undefined（= 变成顶层），
  * 其余交给 overlay 里那份唯一实现 —— **不重复实现防环**。
  */
+/**
+ * `canSetParent` 的宽松版 —— **算法在 `overlay/manual.js`，这里只把注入的实现传进去**。
+ *
+ * 为什么不各写一份：环逻辑分叉是这类代码最贵的 bug，
+ * 所以「宽松包装」只有一个实现，两份 `canSetParent` 来源共用它。
+ */
 function canSetParentLoose(doc, parentId, childId) {
-  if (parentId === null || parentId === undefined) {
-    return childId === undefined || doc.nodes[childId] ? { ok: true } : { ok: false, reason: 'missing-child' }
-  }
-  if (childId === undefined) {
-    // 建节点时校验父是否存在（此时还没有子）
-    return doc.nodes[parentId] ? { ok: true } : { ok: false, reason: 'missing-parent' }
-  }
-  return canSetParentShared(doc, childId, parentId)
+  return canSetParentLooseShared(canSetParentShared, doc, parentId, childId)
 }
 
 /** 延迟引用 overlay 的 `canSetParent`，避免 import 顺序问题。 */
@@ -632,7 +629,6 @@ function canSetParentShared(doc, childId, parentId) {
   if (!canSetParentImpl) throw new Error('undo.js 还没收到 canSetParent 实现（应通过 setCanSetParent 注入）')
   return canSetParentImpl(doc, childId, parentId)
 }
-
 /**
  * 注入 overlay 里那份 `canSetParent`。
  *

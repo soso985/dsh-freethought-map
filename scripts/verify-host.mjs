@@ -459,16 +459,26 @@ if (labels.length === 0) {
       .replace(/\bOP_GEOMETRY\b/g, "'geometry'")
       .replace(/\bOP_LINK_ADD\b/g, "'link-add'")
       .replace(/\bOP_LINK_REMOVE\b/g, "'link-remove'")
+      // 客户端没有 `canSetParentCanonical` 这个名字（那是 overlay 内部的 import 别名），
+      // 它用自己的 `canSetParent`。归一化这一种命名差异 —— 语义必须一致。
+      .replace(/\bcanSetParentCanonical\b/g, 'canSetParent')
+      .replace(/\bcanSetParentShared\b/g, 'canSetParent')
   }
 
   // 每个副本的**来源文件**要写清 —— 早先这条只认 locate.js，
   // 所以 undo.js 的副本（opAnnotate，画布阶段 1）就没法纳进来。
   const undoSource = readFileSync(join(root, 'src', 'overlay', 'undo.js'), 'utf8')
+  const manualSource = readFileSync(join(root, 'src', 'overlay', 'manual.js'), 'utf8')
+  const overlaySource = readFileSync(join(root, 'src', 'overlay', 'index.js'), 'utf8')
   const shared = [
     ['bubbleSelectorCandidates', locateSource],
     ['locateBubble', locateSource],
     ['buildChainView', locateSource],
     ['opAnnotate', undoSource],
+    ['opCreateManual', manualSource],
+    ['canSetParentLoose', manualSource],
+    ['isDescendant', overlaySource],
+    ['canSetParent', overlaySource],
   ]
   let drifted = []
   let compared = 0
@@ -855,6 +865,43 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
       ok('有键盘入口 `F2`（给不用鼠标的用户一条路，真机实测可用）')
     } else {
       bad('没有键盘入口进编辑态')
+    }
+  }
+
+  // ── 新建子节点（画布阶段 1 第 2 项）的接线 ───────────────────────────────
+  {
+    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
+    if (/data-ftm-add-child/.test(clientSource)) {
+      ok('每行有「＋」按钮且带稳定标记 `data-ftm-add-child`（真浏览器据此定位）')
+    } else {
+      bad('没有「＋ 新建子节点」的按钮标记')
+    }
+    if (/opCreateManual\(doc, \{[\s\S]{0,120}parentId: row\.id/.test(clientSource)) {
+      ok('「＋」以**被点的那一行**为父调用 opCreateManual')
+    } else {
+      bad('「＋」没有以该行为父')
+    }
+    if (/saveAuthority\(\{ \.\.\.r\.doc, focusId: r\.id \}/.test(clientSource)) {
+      ok('建完把焦点指到新节点并走同一条 save（新建的节点就该是当前焦点）')
+    } else {
+      bad('建完没有设焦点或没走 save')
+    }
+
+    // ⚠️ TDZ 陷阱：`const canSetParent = deps.canSetParent || canSetParent` 里，
+    // 同名的 `const` 会遮蔽外层函数，`|| canSetParent` 读到**还没初始化的自己**。
+    // 真机上就是这么炸的：点「＋」毫无反应，只有 console 一条
+    // `ReferenceError: Cannot access 'canSetParent' before initialization`。
+    // 离线断言当时全绿也看不出来（宿主那份用的是不同名的 `canSetParentCanonical`）。
+    const tdz = /const\s+(\w+)\s*=\s*deps\.canSetParent\s*\|\|\s*\1\b/
+    for (const [tag, src] of [
+      ['客户端副本', clientSource],
+      ['overlay/manual.js', readFileSync(join(root, 'src', 'overlay', 'manual.js'), 'utf8')],
+    ]) {
+      if (tdz.test(src)) {
+        bad(`${tag} 有 TDZ 自遮蔽：\`const X = deps.canSetParent || X\` —— 会抛 Cannot access before initialization`)
+      } else {
+        ok(`${tag} 没有 TDZ 自遮蔽（默认值落在不同名常量上）`)
+      }
     }
   }
 

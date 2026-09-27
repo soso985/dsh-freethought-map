@@ -1,0 +1,78 @@
+feat(canvas): 阶段 1 第 2 项 —— 每行「＋ 新建子节点」（含真机抓到的 TDZ bug）
+
+按边界只做阶段 1 第 2 项：新建子节点。不做第 3 项（摘除）、不接撤销栈、
+不碰 2D 画布 DOM。单独做、单独验。
+
+## 做了什么
+
+每行右侧「＋」→ 在该行下建一个 `kind: 'manual'` 节点 → 焦点跟到新节点 → 走同一条 `save`。
+位置给「父的右下方」作初值（阶段 3 会按几何重排）。
+
+## 顺手做了一次「减抄写面」的重构
+
+`opCreateManual` 原先在 `undo.js`，但它依赖 `canSetParentLoose`，而后者连着
+`setCanSetParent` 的注入接线。客户端不能 import 相对模块 ⇒ 要用它就得抄
+**函数 + 私有依赖 + 注入接线**三样，三处都可能分叉。
+
+迁到 `src/overlay/manual.js`（零依赖纯函数模块，只 import `index.js` 的 `canSetParent`）后：
+- `undo.js` 重新导出它，**不存在两份实现**；
+- 客户端只需**逐字复制一个函数**。
+防漂移断言从 3 个函数扩到 **8 个**（新增 opCreateManual / canSetParentLoose / isDescendant / canSetParent）。
+
+## 真机抓到的一个真 bug：TDZ 自遮蔽
+
+```
+ReferenceError: Cannot access 'canSetParent' before initialization
+    at opCreateManual
+```
+
+为了「逐字一致」我把客户端的 `canSetParentCanonical` 对齐成了本地那份 `canSetParent`，
+于是函数体里出现：
+
+```js
+const canSetParent = deps.canSetParent || canSetParent   // ← 右边读的是还没初始化的自己
+```
+
+**同作用域的 `const` 遮蔽了外层函数** ⇒ TDZ 报错。症状是点「＋」**毫无反应**，
+只有 console 里一条异常 —— 面板不报错、不落盘、静默失败。
+
+为什么离线断言全绿也看不出来：宿主那份用的是**不同名**的 `canSetParentCanonical`，
+所以只有客户端副本会炸；而离线套件跑的是宿主那份。
+**「对齐命名」这个动作本身制造了 bug** —— 这是逐字复制策略的意外代价。
+
+修法：默认值落在**不同名**常量 `canSetParentFn` 上（两处都改，保持逐字一致）。
+
+新增两条断言 + 变异测试：
+- 机械判据 `const X = deps.canSetParent || X`（自遮蔽形状）**必须不出现**，两侧都查
+- 变异（改回自遮蔽写法）⇒ **2 条红**（TDZ 断言 + 漂移断言），确认能咬住
+
+## 真机验收（17/17，`scripts/cdp-create-child.mjs`）
+
+| 主人指定的验收条 | 结果 |
+| --- | --- |
+| 新建后**父指向正确** | ✅ `parentId = 被点的那一行`；kind=manual；id 以 M 开头；焦点跟到新节点 |
+| **防环挡住** | ✅ 两半都验：<br>· 客户端守卫**放行**合法挂法（在 14 层深的子节点上再建一层，建完仍过宿主合法性校验）<br>· 宿主层提交带环 doc → `status=rejected`（`parentId 成环：…`），**权威没动**、`parentId` 没被改坏 |
+| **落盘** | ✅ rev 33 → 34 |
+| **刷新仍在** | ✅ 权威与面板链里都还在 |
+
+> ②「防环」为什么这么验（写清楚以免假绿）：UI 上**没有**改父入口（拉线改父是阶段 3），
+> 所以"把父挂到后代上"无法从界面触发。客户端守卫在**建节点**时只校验"父存在"
+> （新节点还没有子，不可能成环）；真正拦脏数据的是宿主 `applySave` → `validateOverlay` 的成环检查。
+> 所以两半合起来才是完整结论。若客户端那份把"父存在"误判成环，②a 就会失败。
+
+## 新增离线断言（verify-undo 42/42，+2）
+
+- 在**深层**父上连建 5 层 → 结果仍通过 `validateOverlay`，父链 8 跳不断
+- 默认 id 生成器**同一毫秒连建 40 个不撞已有节点**（撞了节点数会少 —— 用节点数断言）
+
+## 清理
+
+验收建出的 2 个节点已在脚本内自动删除（`manual=0`，rev → 37）。
+权威最终：rev=40、nodes=17、**manual=0**。
+
+## 验收
+
+- 11 套离线全绿：**400 条断言**（verify-host 88，verify-undo 42）
+- verify-session **23/23**
+- `cdp-create-child.mjs` **17/17**
+- `cdp-annotate.mjs` **10/10**（回归：没被这次改动碰坏）
