@@ -517,6 +517,41 @@ return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
 那是接线问题，由 `verify-host` 的结构断言（订阅了 `agent/pre-step`、`await next()`、
 委托给 `computeInjection`）与 `verify-inject` 的行为断言两头夹住。
 
+### 3.15 只读三工具的实现契约（卡 6）
+
+**`ctx.tools.register(definition)` 的真实校验**（`dsh-tools/lib/index.js` 的 `register`）：
+
+| 要求 | 细节 |
+| --- | --- |
+| `output` 必须是对象且 `output.render` 是函数 | 否则 `TypeError: tool "x" must declare output { schema, render, presentationMeta? }` |
+| `output.schema` 要过 `assertSupportedJsonSchema` | 支持的关键字：`type` / `oneOf` / `properties` / `required` / `additionalProperties` / `items` / `enum` / `const`，加注解 `description` / `title` / `default` / `examples`。**没有 `maximum` / `minimum`** |
+| `parameters` **不经过**同一道校验 | ⚠️ 手写定义会绕过它 —— 参数白名单在 `defineTool` 内部的 `parameterSchemaSpecToJsonSchema` 里。我们另加自建白名单守卫 |
+| `name` 不得是 `run_code` | 那是 PTC 传输保留名 |
+
+**不 import `defineTool`**：它只是把 DSL 编译成 JSON Schema（`parameterSchemaSpecToJsonSchema`），
+我们直接手写编译后的形状，少一个裸包依赖（宿主 runtime 解析不到任何裸包名，§3.9）。
+
+**`ToolRuntime` 构造路径的真实依赖**（写测试替身时照此）：
+
+| 调用 | 条件 | 证据 |
+| --- | --- | --- |
+| `ctx.systemPrompt.tools((context) => this.wireSchemas(context.scope))` | **无条件** | `dsh-tools/lib/index.js:2707` |
+| `ctx.systemPrompt.section(this.collapseSection())` / `sdkSection()` | 仅当 `defaultMode !== 'native'`（PTC） | 同文件 `if (this.defaultMode !== "native")` |
+| `ctx.systemPrompt.getSectionOrder('PTC_ONLY' / 'TOOLS_SDK')` | 仅 PTC 段 | 同文件 |
+
+**两条铁律**（`src/overlay/tools.js`）：
+
+| 铁律 | 实现 | 断言 |
+| --- | --- | --- |
+| **只有只读工具** | 没有 add/create/link/move/hide/delete | 工具名不含写动词、描述自报"只读"、声明数正好 3 |
+| **会话身份来自执行上下文** | `sessionIdFromExecution(exec)` = `exec.agent?.session.header.id`，退化到 `session.id` → `agent.id`，取不到返回 `null` | getDoc 只被传入执行上下文给的 id；工具里不得出现 `currentSession` / `ctx.session` 式访问 |
+
+取不到会话就**拒绝调用**（回一条可读说明），绝不 fallback 到"浏览器当前打开的会话"——
+那会让会话 A 的 agent 读到会话 B 的图。
+
+**宿主实测信号**：`inject` 里写错服务名会让整个 Web UI 拒绝加载（卡 1/2 各踩过一次），
+所以「UI 正常加载」本身就是 `tools` 服务解析成功 + 注册路径跑通的证据。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
