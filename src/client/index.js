@@ -300,6 +300,89 @@ function newManualId() {
   return 'M' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
 }
 
+/**
+ * 摘除节点（画布计划 §8 阶段 1 第 3 项；规格 §6.6「摘除唯一规则」）。
+ *
+ * ⚠️ 这是 `src/overlay/undo.js` 里 `opDelete` 的**逐字副本**（防漂移断言盯着）。
+ * 它依赖三个小同伴（`isHiddenRef`/`cloneNode`/`cloneLink`，紧跟在后面），也一并复制 ——
+ * 这三个都只有几行，且 **undo.js 那边只有 `opDelete` 用它们**，
+ * 所以没有必要为了少抄 3 行去动宿主的结构（上一轮为此搬过一次，代价大于收益）。
+ *
+ * §6.6 的五条规则都在这里：
+ *   1. 子节点（turn 与 manual）`parentId ← X.parentId`（上提，可因此变顶层）
+ *   2. 与 X 相连的粉线删除
+ *   3. X 是 turn ⇒ `hidden` 加入其 `sourceRef`（补链才不会立刻建回）
+ *   4. X 是焦点 ⇒ `focusId ← X.parentId`
+ *   5. 上提后若成环（不应发生）⇒ **拒绝此次删除**并提示
+ *
+ * `op` 里带上撤销所需的一切（节点快照、被上提子节点的原父、被删粉线、hiddenRef、
+ * 焦点原值），所以撤销能完全恢复 —— 第 4 项（Ctrl+Z）接线时直接用。
+ */
+function opDelete(doc, id) {
+  const node = doc.nodes[id]
+  if (!node) return { ok: false, reason: 'missing', doc }
+
+  const parentId = node.parentId ?? null
+  // 上提后是否成环？规格：「上提后若成环（不应发生）：拒绝此次删除并提示」
+  const children = Object.values(doc.nodes).filter((n) => n.parentId === id)
+  for (const c of children) {
+    if (c.id === parentId) return { ok: false, reason: 'would-cycle', doc }
+    // 沿新父链向上找，若撞到自己说明成环
+    let cursor = parentId
+    const guard = new Set()
+    while (cursor && !guard.has(cursor)) {
+      if (cursor === id) return { ok: false, reason: 'would-cycle', doc }
+      guard.add(cursor)
+      cursor = doc.nodes[cursor]?.parentId ?? null
+    }
+  }
+
+  const nodes = { ...doc.nodes }
+  delete nodes[id]
+  for (const c of children) nodes[c.id] = { ...nodes[c.id], parentId }
+
+  const removedLinks = doc.freeLinks.filter((l) => l.a === id || l.b === id)
+  const hiddenRef = node.kind === 'turn' && node.sourceRef ? { ...node.sourceRef } : null
+
+  const next = {
+    ...doc,
+    nodes,
+    freeLinks: doc.freeLinks.filter((l) => l.a !== id && l.b !== id),
+    focusId: doc.focusId === id ? parentId : doc.focusId,
+    hidden: hiddenRef && !isHiddenRef(doc.hidden, hiddenRef) ? [...doc.hidden, hiddenRef] : doc.hidden,
+  }
+
+  return {
+    ok: true,
+    doc: next,
+    op: {
+      type: 'delete',
+      id,
+      snapshot: cloneNode(node),
+      liftedChildren: children.map((c) => ({ id: c.id, parentId: id })),
+      removedLinks: removedLinks.map(cloneLink),
+      hiddenRef,
+      // 焦点原值：撤销要原样还回去
+      focusIdBefore: doc.focusId,
+    },
+  }
+}
+
+/** 这个 ref 是否已经在 `hidden` 里（按 kind + eventId 判，不比对象引用）。 */
+function isHiddenRef(hidden, ref) {
+  return (hidden || []).some((h) => h.kind === ref.kind && h.eventId === ref.eventId)
+}
+
+/** 深拷贝一个节点（撤销快照必须是独立副本，不能与 doc 共享引用）。 */
+function cloneNode(node) {
+  return node === undefined || node === null ? node : JSON.parse(JSON.stringify(node))
+}
+
+/** 浅拷贝一条粉线（它只有 id/a/b 三个标量）。 */
+function cloneLink(link) {
+  return { ...link }
+}
+
 function createPlugin(React) {
   const h = React.createElement
   const { useCallback, useEffect, useRef, useState } = React
@@ -574,6 +657,21 @@ function createPlugin(React) {
 }
 [${ROOT_ATTR}] .ftm-chain-row:hover .ftm-chain-add,
 [${ROOT_ATTR}] .ftm-chain-add:focus-visible { opacity: 1; }
+[${ROOT_ATTR}] .ftm-chain-del {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.9em;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--dsw-alias-border-1, rgba(128, 128, 128, 0.35));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0;
+}
+[${ROOT_ATTR}] .ftm-chain-row:hover .ftm-chain-del,
+[${ROOT_ATTR}] .ftm-chain-del:focus-visible { opacity: 1; }
 [${ROOT_ATTR}] .ftm-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
 [${ROOT_ATTR}] .ftm-tools .ftm-btn { flex: 0 0 auto; }
 [${ROOT_ATTR}] .ftm-help {
@@ -1279,6 +1377,56 @@ function createPlugin(React) {
         saveAuthority({ ...r.doc, focusId: r.id }, { kind: 'focus', nodeId: r.id })
       }
 
+      /**
+       * 摘除节点（画布计划 §8 阶段 1 第 3 项）。
+       *
+       * 交互：每行右侧「✕ 摘除」。**这是首个破坏性操作**，所以：
+       *   1. 用 `window.confirm` 明确问一次 —— 摘除会改结构（子节点上提、粉线删、
+       *      turn 进 hidden），不是可以随手点回来的东西（撤销栈第 4 项才接）。
+       *   2. 摘除是**纯函数** `opDelete` 算出来的（§6.6 五条规则都在里面，有 40 条断言），
+       *      这里只负责接线：算 → 提交 → 焦点已在 `opDelete` 里按规则回退。
+       *   3. 失败要**说出来**（`would-cycle` 这类拒绝不能静默）。
+       */
+      const onDeleteRow = (row) => {
+        const doc = authority.doc
+        if (!doc) return
+        const node = doc.nodes[row.id]
+        if (!node) return
+        const childCount = Object.values(doc.nodes).filter((n) => n.parentId === row.id).length
+        const what = node.kind === 'turn' ? '这个回合节点' : '这个手建节点'
+        const detail =
+          childCount > 0
+            ? `它的 ${childCount} 个子节点会上提一层` +
+              (node.kind === 'turn' ? '；该回合会进 hidden（补链不会立刻建回）' : '')
+            : node.kind === 'turn'
+              ? '该回合会进 hidden（补链不会立刻建回）'
+              : ''
+        let yes = true
+        try {
+          yes = window.confirm('摘除' + what + '？' + (detail ? '\n' + detail : ''))
+        } catch {
+          /* confirm 不可用（极少数环境）就按"确认"走 —— 与官方按钮的语义一致 */
+        }
+        if (!yes) return
+
+        const r = opDelete(doc, row.id)
+        if (!r.ok) {
+          setAuthority((s) => ({
+            ...s,
+            notice:
+              r.reason === 'would-cycle'
+                ? '摘除被拒绝：上提子节点会形成环（规格 §6.6 要求拒绝而不是硬做）'
+                : '摘除失败：' + (r.reason || '未知原因'),
+          }))
+          return
+        }
+        setHighlightId(null)
+        if (annotating && annotating.nodeId === row.id) setAnnotating(null)
+        setAuthority((s) => ({ ...s, notice: '' }))
+        // 焦点回退已经由 `opDelete` 按 §6.6 算好了（在被删节点是焦点时 = 它的父）
+        saveAuthority(r.doc, null)
+      }
+
       const onJumpToBubble = (row) => {        // 作用域给 document：气泡在官方对话列里，不在我们面板内
         const r = scrollToBubble(document, row)
         if (r.ok) {
@@ -1389,6 +1537,19 @@ function createPlugin(React) {
                     },
                   },
                   '＋',
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'ftm-chain-del',
+                    'data-ftm-delete': row.id,
+                    title: '摘除这个节点（子节点上提、粉线删除；turn 会进 hidden）',
+                    onClick: (e) => {
+                      e.stopPropagation()
+                      onDeleteRow(row)
+                    },
+                  },
+                  '✕',
                 ),
                 row.sourceRef
                   ? h(

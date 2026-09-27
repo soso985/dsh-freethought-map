@@ -475,6 +475,10 @@ if (labels.length === 0) {
     ['locateBubble', locateSource],
     ['buildChainView', locateSource],
     ['opAnnotate', undoSource],
+    ['opDelete', undoSource],
+    ['isHiddenRef', undoSource],
+    ['cloneNode', undoSource],
+    ['cloneLink', undoSource],
     ['opCreateManual', manualSource],
     ['canSetParentLoose', manualSource],
     ['isDescendant', overlaySource],
@@ -905,6 +909,52 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
     }
   }
 
+  // ── 摘除（画布阶段 1 第 3 项）的接线 ─────────────────────────────────────
+  //
+  // 摘除是**首个破坏性操作**（改结构 + 写 hidden + 删粉线），所以接线的每一条都要盯住。
+  {
+    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
+    if (/data-ftm-delete/.test(clientSource)) {
+      ok('每行有「✕ 摘除」按钮且带稳定标记 `data-ftm-delete`')
+    } else {
+      bad('没有「✕ 摘除」的按钮标记')
+    }
+    if (/opDelete\(doc, row\.id\)/.test(clientSource)) {
+      ok('摘除走纯函数 `opDelete(doc, row.id)`（§6.6 五条规则在纯函数里，有 40 条断言）')
+    } else {
+      bad('摘除没有走 opDelete')
+    }
+    // 破坏性操作必须先问一次
+    if (/window\.confirm\(/.test(clientSource)) {
+      ok('摘除前用 `window.confirm` 明确问一次（撤销栈还没接，不能随手点回来）')
+    } else {
+      bad('破坏性操作没有二次确认')
+    }
+    // `opDelete` 会拒绝成环；拒绝必须**说出来**
+    if (/r\.reason === 'would-cycle'/.test(clientSource) && /摘除被拒绝/.test(clientSource)) {
+      ok('`would-cycle` 这类拒绝会**说出来**（不是静默失败）—— §6.6 要求「拒绝并提示」')
+    } else {
+      bad('摘除被拒绝时没有可见提示')
+    }
+    if (/setAuthority\(\(s\) => \(\{ \.\.\.s, notice: '' \}\)\)[\s\S]{0,120}saveAuthority\(r\.doc, null\)/.test(clientSource)) {
+      ok('摘除成功后清掉提示并提交（走同一条 save）')
+    } else {
+      bad('摘除后没有提交或没清提示')
+    }
+    // 被摘的行如果正在编辑注解，编辑态要一起收掉（否则编辑框指向一个不存在的节点）
+    if (/annotating\.nodeId === row\.id\) setAnnotating\(null\)/.test(clientSource)) {
+      ok('被摘的行若正在编辑注解，编辑态一起收掉（不会留一个指向已删节点的编辑框）')
+    } else {
+      bad('摘除时没有收掉该行的编辑态')
+    }
+    // 焦点回退必须由 opDelete 算（不能在这里另写一套）
+    if (/focusId: doc\.focusId === id \? parentId : doc\.focusId/.test(clientSource)) {
+      ok('焦点回退在 `opDelete` 里按 §6.6 算（（不为摘除另写一套规则）')
+    } else {
+      bad('焦点回退逻辑不在 opDelete 里')
+    }
+  }
+
   // ⚠️ 这里**不该**再有任何"测试专用写入口"。
   // 早先有个 `importTitles` RPC 端点，但它只有验收脚本在调 ——
   // 「只在测试里用、没有任何调用方开放」的写入口不该留在产品里（主人 2026-09-27 点名）。
@@ -1085,6 +1135,43 @@ if (hostMod.__test && typeof hostMod.__test.persistDerivedTitle === 'function') 
   T.titlesCache.delete(sid)
 } else {
   bad('__test 没导出 persistDerivedTitle —— 无法离线驱动首建分支')
+}
+
+// ── 13. 验收工具的护栏：`cdp-panel.mjs` 不许"静默跑错会话" ────────────────────
+//
+// 为什么这事值得断言：摘除（阶段 1 第 3 项）是**首个破坏性操作**，而验收脚本会写盘。
+// 真机实证过代价 —— `verify-session` 曾把测试节点写进两个**不该碰**的空白会话。
+// 根因是 `openSession` 的早退判据「页面上有没有气泡」与目标会话**无关**：
+// 只要残留会话有聊天记录就直接 alreadyOpen、**根本没点**，调用方却以为切好了。
+{
+  const panelSource = readFileSync(join(root, 'scripts', 'cdp-panel.mjs'), 'utf8')
+  if (/async function conversationSession\(/.test(panelSource)) {
+    ok('有 `conversationSession()`（读 `[data-conversation-session]`）—— 判断"进了哪个会话"的权威依据')
+  } else {
+    bad('没有 conversationSession()，会话判断只能靠"有没有气泡"（不可靠）')
+  }
+  // 早退必须**先比对会话**，不能再只看气泡
+  if (/if \(want && now === want\)/.test(panelSource)) {
+    ok('`openSession` 的早退**先比对会话 id**（不是只看有没有气泡）')
+  } else {
+    bad('`openSession` 的早退没比对会话 id —— 残留会话有气泡时会静默不切')
+  }
+  // 切完必须核实；核实不过要报失败
+  if (/nowAfter !== want/.test(panelSource) && /note: '点了会话行，但正文容器的会话 id 仍是/.test(panelSource)) {
+    ok('切完会**核实**会话 id；不匹配就报 `ok:false`（不假装成功）')
+  } else {
+    bad('切完不核实会话 id —— 失败了也报 ok:true')
+  }
+  if (/if \(want\) return n > 0 && p === want && c === want/.test(panelSource)) {
+    ok('`ensurePanelOpen` 要求**面板可见根**与**正文容器**的会话**都**等于目标')
+  } else {
+    bad('ensurePanelOpen 只看"面板挂上了"，没要求会话正确')
+  }
+  if (/offsetParent !== null/.test(panelSource) && /async function allRoots\(/.test(panelSource)) {
+    ok('只认**可见**的面板根（后台会话的隐藏根不算"已挂载"），多根会报出来')
+  } else {
+    bad('没有区分可见/隐藏的面板根 —— 可能读到隐藏那个会话')
+  }
 }
 
 // ── 报告 ────────────────────────────────────────────────────────────────────
