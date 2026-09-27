@@ -104,6 +104,157 @@ function createPlugin(React) {
   const h = React.createElement
   const { useCallback, useEffect, useRef, useState } = React
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 下面两个函数是 `src/overlay/locate.js` 里同名函数的**逐字副本**。
+  //
+  // 为什么复制而不是 import：客户端 bundle 是单文件自包含的惰性 CJS 注册，
+  // **不能同步 require 另一个相对模块**（官方 README 明令）。
+  //
+  // 防漂移：`scripts/verify-host.mjs` 会把两份源码里的函数体抽出来逐字比对，
+  // 不一致直接 FAIL。所以复制是安全的 —— 它不会悄悄分叉。
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 官方 user 气泡的 Definition kind（`dsh-client-ui-chat` 的 `messageDefinition.kind`）。
+   * 只有 user 结算能确定地构造出精确 key；assistant 的 kind 我们不去猜。
+   */
+  const OFFICIAL_USER_KIND = 'input-message'
+
+  /** 候选选择器，按可靠性从高到低（副本，见上）。 */
+  function bubbleSelectorCandidates(node) {
+    const ref = node && node.sourceRef
+    if (!ref || !ref.eventId) return []
+    const id = String(ref.eventId)
+    // 属性值里的引号/反斜杠要转义，否则注入坏选择器
+    const esc = id.replace(/["\\]/g, '\\$&')
+    const out = []
+
+    // 1) 精确 key（只有 user 结算能确定地构造出来：kind 已知 + id 就是 data.id）
+    if (ref.kind === 'user-message') {
+      out.push(`[data-chat-node-key="${OFFICIAL_USER_KIND.length}:${OFFICIAL_USER_KIND}${esc}"]`)
+    }
+
+    // 2) 后缀匹配：key 一定以该结算的 id 结尾 —— 不依赖官方 kind 名
+    out.push(`[data-chat-node-key$="${esc}"]`)
+
+    // 3) 退一步：任何 chat 标记里以该 id 结尾（涵盖 anchor/flow 两种属性）
+    out.push(`[data-chat-anchor-key$="${esc}"]`)
+
+    return out
+  }
+
+  /**
+   * 找官方气泡 —— **全项目唯一直接读宿主内部 DOM 的地方**（副本，见上）。
+   * 命中多个报 ambiguous，绝不盲选；找不到如实报 not-found。
+   */
+  function locateBubble(root, node) {
+    if (!node || !node.sourceRef || !node.sourceRef.eventId) {
+      return { ok: false, reason: 'no-source-ref' }
+    }
+    if (!root || typeof root.querySelectorAll !== 'function') {
+      return { ok: false, reason: 'not-found', detail: 'no-dom' }
+    }
+    const candidates = bubbleSelectorCandidates(node)
+    if (candidates.length === 0) return { ok: false, reason: 'no-source-ref' }
+
+    for (const selector of candidates) {
+      let hits
+      try {
+        hits = root.querySelectorAll(selector)
+      } catch (e) {
+        continue // 选择器语法问题：跳过这一级，交给下一级
+      }
+      if (hits.length === 1) return { ok: true, el: hits[0], selector }
+      if (hits.length > 1) {
+        return { ok: false, reason: 'ambiguous', detail: selector + ' → ' + String(hits.length) }
+      }
+    }
+    return { ok: false, reason: 'not-found' }
+  }
+
+  /** 滚到气泡 + 临时高亮（内联样式，不注入样式表、不留全局 class）。 */
+  function scrollToBubble(root, node, opts) {
+    const found = locateBubble(root, node)
+    if (!found.ok) return found
+    const el = found.el
+    try {
+      if (typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      }
+    } catch {
+      /* 不支持 options 参数也不致命 */
+    }
+    const holdMs = opts && Number.isFinite(opts.holdMs) ? opts.holdMs : 1200
+    let restore = null
+    try {
+      const prevOutline = el.style && el.style.outline
+      const prevOffset = el.style && el.style.outlineOffset
+      if (el.style) {
+        el.style.outline = '2px solid var(--dsw-alias-brand, rgb(64, 128, 255))'
+        el.style.outlineOffset = '2px'
+        restore = () => {
+          if (!el.style) return
+          el.style.outline = prevOutline || ''
+          el.style.outlineOffset = prevOffset || ''
+        }
+      }
+    } catch {
+      /* 改不了样式不影响"滚过去了" */
+    }
+    if (restore) {
+      const timer = typeof setTimeout === 'function' ? setTimeout : null
+      if (timer) timer(restore, holdMs)
+      else restore()
+    }
+    return { ok: true, selector: found.selector }
+  }
+
+  /** 链的显示模型（副本，见上；注解三态在这里落地）。 */
+  function buildChainView(doc, opts = {}) {
+    if (!doc || !doc.nodes) return []
+    const derived = opts.derivedTitles || {}
+    const kids = new Map()
+    for (const node of Object.values(doc.nodes)) {
+      const list = kids.get(node.parentId) || []
+      list.push(node.id)
+      kids.set(node.parentId, list)
+    }
+    // 顶层：无父，或父已不存在
+    const roots = Object.values(doc.nodes)
+      .filter((n) => !n.parentId || !doc.nodes[n.parentId])
+      .map((n) => n.id)
+
+    const out = []
+    const seen = new Set()
+    const walk = (id, depth) => {
+      if (seen.has(id)) return
+      seen.add(id)
+      const node = doc.nodes[id]
+      if (!node) return
+      const annotated = node.title
+      let title
+      if (annotated === undefined || annotated === null) title = derived[id] || ''
+      else title = annotated // 含 "" —— 用户主动清空，不回退
+      out.push({
+        id,
+        kind: node.kind,
+        depth,
+        sourceRef: node.sourceRef || null,
+        title,
+        hasAnnotation: annotated !== undefined && annotated !== null,
+        isFocus: doc.focusId === id,
+        seq: Number(node.seq) || 0,
+      })
+      for (const c of kids.get(id) || []) walk(c, depth + 1)
+    }
+    // 链的阅读顺序 = 按投影时间（seq）排；同 seq 用 id 稳定排序
+    roots.sort((a, b) => (doc.nodes[a].seq || 0) - (doc.nodes[b].seq || 0) || (a < b ? -1 : 1))
+    for (const r of roots) walk(r, 0)
+    // 孤岛（父存在但自己在环里）也要列出来，别丢节点
+    for (const id of Object.keys(doc.nodes)) walk(id, 0)
+    return out
+  }
+
   // ───────────────────────────── 样式（局部，不污染宿主） ─────────────────────────────
   // 根节点前缀 + CSS 变量；绝不写 html / body / :root。颜色全部走 --dsw-alias-* token。
   const CSS = `
@@ -148,6 +299,55 @@ function createPlugin(React) {
 }
 [${ROOT_ATTR}] .ftm-notice[data-ftm-notice='failed'] { border-color: var(--dsw-alias-danger, rgba(192, 57, 43, 0.7)); }
 [${ROOT_ATTR}] .ftm-notice[data-ftm-notice='conflict'] { border-color: var(--dsw-alias-warning, rgba(183, 121, 31, 0.7)); }
+[${ROOT_ATTR}] .ftm-notice[data-ftm-notice='warn'] { border-color: var(--dsw-alias-warning, rgba(183, 121, 31, 0.7)); }
+[${ROOT_ATTR}] .ftm-chain { list-style: none; margin: 0 0 10px; padding: 0; }
+[${ROOT_ATTR}] .ftm-chain-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+  margin-bottom: 2px;
+}
+[${ROOT_ATTR}] .ftm-chain-row:hover { background: var(--dsw-alias-bg-hover, rgba(128, 128, 128, 0.12)); }
+[${ROOT_ATTR}] .ftm-chain-row.is-active { background: var(--dsw-alias-bg-hover, rgba(128, 128, 128, 0.18)); }
+[${ROOT_ATTR}] .ftm-chain-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  text-align: left;
+  padding: 4px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+[${ROOT_ATTR}] .ftm-chain-badge {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+  opacity: 0.7;
+  border: 1px solid var(--dsw-alias-border-1, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  padding: 0 4px;
+}
+[${ROOT_ATTR}] .ftm-chain-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[${ROOT_ATTR}] .ftm-chain-row.is-focus .ftm-chain-title { font-weight: 600; }
+[${ROOT_ATTR}] .ftm-chain-jump {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.85em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--dsw-alias-border-1, rgba(128, 128, 128, 0.35));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0;
+}
+[${ROOT_ATTR}] .ftm-chain-row:hover .ftm-chain-jump { opacity: 1; }
 [${ROOT_ATTR}] .ftm-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0 0 10px; }
 [${ROOT_ATTR}] .ftm-kv dt { opacity: 0.72; white-space: nowrap; }
 [${ROOT_ATTR}] .ftm-kv dd {
@@ -238,6 +438,34 @@ function createPlugin(React) {
         notice: '',
       })
       const inflight = useRef(0)
+      /** 本面板内的高亮（画布还没做，卡 7 才接真画布） */
+      const [highlightId, setHighlightId] = useState(null)
+      /** 「跳到气泡」的可见反馈（找不到 / 命中多个 都要说出来，不静默） */
+      const [jumpNotice, setJumpNotice] = useState(null)
+
+      /**
+       * 从宿主的事件日志里取派生标题。
+       *
+       * 为什么从事件日志拿而不是从 overlay 拿：规格 §6.4 明写派生标题
+       * **不写入 title 字段**，所以 overlay 里没有它。宿主在投影时顺手把派生标题
+       * 记进事件日志（`SettlementLog`），客户端直接读 —— 两边不必各实现一遍截断规则。
+       */
+      const [derivedTitles, setDerivedTitles] = useState({})
+      const loadDerivedTitles = useCallback(
+        (sid) => {
+          if (!sid) return
+          callRemote(ctx, 'events', { sessionId: sid, sinceSeq: -1 }).then((r) => {
+            if (!r || r.ok !== true) return
+            const entries = (r.value && r.value.entries) || []
+            const idx = {}
+            for (const e of entries) {
+              if (e && e.eventId && e.title) idx[String(e.eventId)] = String(e.title)
+            }
+            setDerivedTitles(idx)
+          })
+        },
+        [ctx],
+      )
 
       // 会话变了（或首次挂载）→ 从宿主 load 权威。用自增计数丢弃过期响应。
       useEffect(() => {
@@ -273,6 +501,7 @@ function createPlugin(React) {
               return
             }
             setAuthority({ sessionId, doc: payload.doc, rev: payload.rev, status: 'ready', notice: '' })
+            loadDerivedTitles(sessionId)
           },
           (e) => {
             if (ticket !== inflight.current) return
@@ -286,7 +515,7 @@ function createPlugin(React) {
           },
         )
         return undefined
-      }, [sessionId])
+      }, [sessionId, loadDerivedTitles])
 
       /**
        * 保存到宿主权威。演示卡 2 的完整协议：
@@ -428,6 +657,90 @@ function createPlugin(React) {
         return out
       })
 
+      /**
+       * 卡 4：把链渲染成可点的行。
+       *
+       * 每行做三件事：
+       *   1. 显示（注解三态由 buildChainView 处理，派生标题从宿主事件日志取）；
+       *   2. 点了 → 本面板高亮 + **焦点跟随**（规格 §5：单击节点同时设 focus）；
+       *   3. 有 sourceRef 的行 → 「跳到气泡」，走 scrollToBubble（**唯一读宿主 DOM 的地方**，
+       *      找不到/命中多个都如实提示，不静默）。
+       */
+      const chainRows = buildChainView(authority.doc || { nodes: {} }, { derivedTitles })
+
+      const onRowClick = (row) => {
+        setHighlightId(row.id)
+        // 焦点与选中分离：这里只动本面板的高亮 + 把焦点写回权威
+        const doc = authority.doc
+        if (!doc || doc.focusId === row.id) return
+        saveAuthority({ ...doc, focusId: row.id })
+      }
+
+      const onJumpToBubble = (row) => {
+        // 作用域给 document：气泡在官方对话列里，不在我们面板内
+        const r = scrollToBubble(document, row)
+        if (r.ok) {
+          setJumpNotice({ tone: 'ok', text: '已跳到对应气泡' })
+        } else if (r.reason === 'ambiguous') {
+          setJumpNotice({ tone: 'warn', text: '找到多个候选气泡，未跳转（避免跳错）：' + (r.detail || '') })
+        } else if (r.reason === 'no-source-ref') {
+          setJumpNotice({ tone: 'warn', text: '手建节点没有对应气泡' })
+        } else {
+          setJumpNotice({
+            tone: 'warn',
+            text: '没找到对应气泡（官方没有公开的定位 API，这里是按 DOM 属性找的降级路径）',
+          })
+        }
+      }
+
+      const chainList = chainRows.length
+        ? h(
+            'ul',
+            { className: 'ftm-chain', 'data-ftm-chain': String(chainRows.length) },
+            chainRows.map((row) =>
+              h(
+                'li',
+                {
+                  key: row.id,
+                  className:
+                    'ftm-chain-row' +
+                    (row.isFocus ? ' is-focus' : '') +
+                    (highlightId === row.id ? ' is-active' : ''),
+                  'data-ftm-node': row.id,
+                  'data-ftm-kind': row.kind,
+                  style: { paddingLeft: 6 + row.depth * 12 },
+                },
+                h(
+                  'button',
+                  {
+                    className: 'ftm-chain-main',
+                    title: '选中并把焦点移到这里（下一句默认挂到它下面）',
+                    onClick: () => onRowClick(row),
+                  },
+                  h('span', { className: 'ftm-chain-badge' }, row.kind === 'turn' ? '回合' : '手建'),
+                  h(
+                    'span',
+                    { className: 'ftm-chain-title' },
+                    // 注解是空串时**显示空**，用一个占位符表明"用户主动清空了"
+                    row.title === '' ? (row.hasAnnotation ? '（已清空）' : '（无标题）') : row.title,
+                  ),
+                ),
+                row.sourceRef
+                  ? h(
+                      'button',
+                      {
+                        className: 'ftm-chain-jump',
+                        title: '跳到官方对话里对应的气泡',
+                        onClick: () => onJumpToBubble(row),
+                      },
+                      '跳到气泡',
+                    )
+                  : null,
+              ),
+            ),
+          )
+        : h('p', { className: 'ftm-hint' }, '这个会话还没有回合。发一句话，链就会长出来。')
+
       const body = h(
         'div',
         { className: 'ftm-body' },
@@ -446,8 +759,20 @@ function createPlugin(React) {
         h(
           'p',
           { className: 'ftm-hint' },
-          '卡 2：宿主权威存储已接通。思路链画布在卡 3 之后落地。',
+          '链（点一行把焦点移过去；有对应气泡的可以跳过去）',
         ),
+        jumpNotice
+          ? h(
+              'p',
+              {
+                className: 'ftm-notice',
+                role: 'status',
+                'data-ftm-notice': jumpNotice.tone,
+              },
+              jumpNotice.text,
+            )
+          : null,
+        chainList,
         h(
           'dl',
           { className: 'ftm-kv' },
@@ -463,18 +788,10 @@ function createPlugin(React) {
           h('dd', null, authority.status),
           h('dt', null, '权威 rev'),
           h('dd', null, String(authority.rev)),
-          h('dt', null, '权威节点数'),
+          h('dt', null, '节点数'),
           h('dd', null, authority.doc ? String(Object.keys(authority.doc.nodes || {}).length) : '—'),
-          h('dt', null, 'slot 来源'),
-          h('dd', null, probe.slotSource),
-        ),
-        h('div', { className: 'ftm-hint' }, '宿主可见 slot（' + probe.slotNames.length + '）：'),
-        h(
-          'ul',
-          { className: 'ftm-slots' },
-          probe.slotNames.length
-            ? probe.slotNames.slice(0, 300).map((n) => h('li', { key: n }, n))
-            : h('li', null, '（未找到枚举 API —— 见 docs/HOST.md 探针 P1）'),
+          h('dt', null, '焦点'),
+          h('dd', null, (authority.doc && authority.doc.focusId) || '（无）'),
         ),
       )
 

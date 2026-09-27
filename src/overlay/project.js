@@ -392,6 +392,9 @@ export class SettlementLog {
       eventId: String(eventIdOf(event) || '?'),
       at: Date.now(),
       outcome,
+      // 派生标题一起记下来：它**不落盘**（规格 §6.4），但客户端显示时需要它。
+      // 在宿主算一次，客户端就不用再实现一遍同样的截断规则。
+      title: deriveTitleFor(textOf(event)),
     })
     if (list.length > this.limit) list.splice(0, list.length - this.limit)
     this.bySession.set(sessionId, list)

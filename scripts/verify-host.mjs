@@ -313,6 +313,101 @@ if (labels.length === 0) {
   bad('面板里出现可疑按钮：' + suspicious.join(', '))
 }
 
+// ── 7. 客户端副本与 overlay 源文件的**逐字一致**（防漂移）─────────────────────
+//
+// 客户端 bundle 不能 import 相对模块，所以 locate.js / project.js 里几个纯函数
+// 被**逐字复制**进了 client/index.js。复制是安全的 —— 前提是有人盯着别分叉。
+// 这条断言就是那个人：把两份源码里的函数体抽出来逐字比对。
+{
+  const locateSource = readFileSync(join(root, 'src', 'overlay', 'locate.js'), 'utf8')
+
+  /**
+   * 从一个源码里抽出函数体：认 `function name(` 与 `const name = (` 两种写法。
+   *
+   * ⚠️ 不能直接找第一个 `{` —— 参数默认值里就可能带花括号（`opts = {}`），
+   * 那会把它当成函数体、抽出个 `{}` 来。必须先跨过**配平的参数表右括号**，
+   * 之后的第一个 `{` 才是函数体。本轮就是被这个坑了一次。
+   */
+  function extractFunction(src, name) {
+    let start = src.indexOf('function ' + name + '(')
+    if (start < 0) start = src.indexOf('const ' + name + ' = (')
+    if (start < 0) return null
+    const parenStart = src.indexOf('(', start)
+    if (parenStart < 0) return null
+    let pdepth = 0
+    let parenEnd = -1
+    for (let i = parenStart; i < src.length; i += 1) {
+      const ch = src[i]
+      if (ch === '(') pdepth += 1
+      else if (ch === ')') {
+        pdepth -= 1
+        if (pdepth === 0) {
+          parenEnd = i
+          break
+        }
+      }
+    }
+    if (parenEnd < 0) return null
+    const braceStart = src.indexOf('{', parenEnd)
+    if (braceStart < 0) return null
+    let depth = 0
+    for (let i = braceStart; i < src.length; i += 1) {
+      const ch = src[i]
+      if (ch === '{') depth += 1
+      else if (ch === '}') {
+        depth -= 1
+        if (depth === 0) return src.slice(braceStart, i + 1)
+      }
+    }
+    return null
+  }
+
+  /**
+   * 去掉空白与**所有**注释行后比对，避免只因缩进/换行/注释不同就误报。
+   * 注意要把 `}` 后面的行内注释也剥掉（`continue // 说明` 这种），否则会被当成差异。
+   */
+  function normalize(body) {
+    return body
+      .split(/\r?\n/)
+      .map((l) => l.replace(/\s*\/\/.*$/, '').replace(/\s+/g, ' ').trim())
+      .filter((l) => l && !l.startsWith('*') && !l.startsWith('/*'))
+      .join(' ')
+  }
+
+  const shared = ['bubbleSelectorCandidates', 'locateBubble', 'buildChainView']
+  let drifted = []
+  let compared = 0
+  for (const fn of shared) {
+    const a = extractFunction(locateSource, fn)
+    const b = extractFunction(clientSource, fn)
+    if (a === null || b === null) {
+      drifted.push(fn + '(抽不出函数体)')
+      continue
+    }
+    compared += 1
+    if (normalize(a) !== normalize(b)) drifted.push(fn)
+  }
+  if (drifted.length === 0) {
+    ok(`客户端副本与 overlay 源文件逐字一致（${compared} 个函数：${shared.join(', ')}）`)
+  } else {
+    bad('副本已漂移，必须同步修改两处：' + drifted.join(', '))
+  }
+
+  // scrollToBubble 客户端版少了 opts 默认值那点差异，单独比核心语句
+  const aScroll = extractFunction(locateSource, 'scrollToBubble')
+  const bScroll = extractFunction(clientSource, 'scrollToBubble')
+  if (aScroll && bScroll) {
+    const keySentences = [
+      'scrollIntoView({ block: \'center\', behavior: \'smooth\' })',
+      "el.style.outline = '2px solid var(--dsw-alias-brand, rgb(64, 128, 255))'",
+      "el.style.outlineOffset = '2px'",
+    ]
+    const missing = keySentences.filter((s) => !normalize(bScroll).includes(normalize(s)))
+    if (missing.length === 0) ok('scrollToBubble 的关键语句两侧一致（滚动 + 临时高亮 + 还原）')
+    else bad('scrollToBubble 客户端版缺少：' + missing.join(' | '))
+  }
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 const fails = results.filter(([s]) => s === 'FAIL')
 const pad = Math.max(...results.map(([, m]) => m.length))
