@@ -28,6 +28,17 @@ import {
   planProjection,
   settlementKindOf,
 } from '../overlay/project.js'
+import {
+  buildSendSnapshot,
+  consumePending,
+  createPending,
+  makeGraphContextMessage,
+  pendingAdd,
+  pendingRemove,
+  rememberSnapshot,
+  renderSendInjection,
+  spliceInjectionAfterClaimed,
+} from '../overlay/links.js'
 
 /**
  * 领域层与 json 后端实际强制执行的名称正则（`dsh-storage/lib/index.js:80`）：
@@ -251,6 +262,43 @@ class FreethoughtMapHostService {
     const since = Number.isInteger(sinceSeq) ? sinceSeq : -1
     return { ok: true, entries: settlementLog.list(sessionId, since) }
   }
+
+  /**
+   * 拉/删粉线后同步「待注入」集合（卡 5）。客户端拥有 pending 语义，
+   * 这里只保存一份，好让 `agent/pre-step` 注入时取得到。
+   *
+   * @param {string} sessionId
+   * @param {object} payload `{ add?: string[], remove?: string[] }`
+   */
+  async setPendingLinks(sessionId, payload) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    const add = payload && Array.isArray(payload.add) ? payload.add : []
+    const remove = payload && Array.isArray(payload.remove) ? payload.remove : []
+    let p = pendingBySession.get(sessionId) || createPending()
+    for (const id of add) p = pendingAdd(p, String(id))
+    for (const id of remove) p = pendingRemove(p, String(id))
+    pendingBySession.set(sessionId, p)
+    return { ok: true, pending: [...p.ids] }
+  }
+
+  /**
+   * 注入诊断面：把「本轮准备注入什么」记下来，供验收读取。
+   *
+   * 为什么需要：注入是否真的生效，**只有真实发送才能验**。有了这张表，
+   * 用户下一次真实发送时，我们能立刻从日志确认注入内容与条数，而不必靠猜。
+   *
+   * @param {string} sessionId
+   * @param {number} sinceSeq
+   */
+  async injections(sessionId, sinceSeq) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    const since = Number.isInteger(sinceSeq) ? sinceSeq : -1
+    return { ok: true, entries: injectionLog.list(sessionId, since) }
+  }
 }
 
 /**
@@ -259,8 +307,21 @@ class FreethoughtMapHostService {
  */
 const settlementLog = new SettlementLog(200)
 
-// 端点名由 marker 决定：freethoughtMap/load、freethoughtMap/save、freethoughtMap/describe、freethoughtMap/events。
-markRemoteMethods(FreethoughtMapHostService, ['load', 'save', 'describe', 'events'])
+/** 每会话的「待注入粉线」集合（卡 5）。 */
+const pendingBySession = new Map()
+
+/** 注入诊断日志（卡 5）：记「哪一轮注入了什么」。 */
+const injectionLog = new SettlementLog(200)
+
+// 端点名由 marker 决定：freethoughtMap/load、save、describe、events、setPendingLinks、injections。
+markRemoteMethods(FreethoughtMapHostService, [
+  'load',
+  'save',
+  'describe',
+  'events',
+  'setPendingLinks',
+  'injections',
+])
 
 function describeError(e) {
   if (!e) return 'unknown'
@@ -311,6 +372,8 @@ export function buildRemoteContribution() {
       mk('save', [remoteParam('sessionId'), remoteParam('doc'), remoteParam('baseRev')]),
       mk('describe', []),
       mk('events', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
+      mk('setPendingLinks', [remoteParam('sessionId'), remoteParam('payload')]),
+      mk('injections', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
     ],
   }
 }
@@ -462,7 +525,126 @@ export function apply(ctx) {
     'freethought-map: settlement projection',
   )
 
-  log(ctx, '宿主一半已激活：overlay 权威存储就绪（dsh 0.1.7-rc.2 c1275515）')
+  // (d) 发送前注入（卡 5 / 规格 §10.3、§10.4）。
+  //
+  // 事件形状（`dsh-tool-cordis/lib/types/api-catalog.js` 的 `'agent/pre-step'`）：
+  //   waterfall，`payload = { agent, messages: UserMessage[], turn, step, signal }`，
+  //   `next(): Promise<PreStepDecision>`；
+  //   `PreStepDecision = { kind:'reject' } | { kind:'enter', messages: UserMessage[], startsRequestSeries?: true }`
+  //
+  // 四条纪律：
+  //   1. **必须 `await next()`** —— 不然会吞掉下游所有 listener 的决策。
+  //      （官方 practice：「waterfall listener that does not own the decision must return next()」）
+  //   2. 返回时是**整体替换** `messages`，所以要自己保留原数组
+  //      （照抄 `dsh-agent-instructions` 的 toSpliced 写法）。
+  //   3. **不唤醒、不 followup、不改写用户原文** —— 只往消息批次里**插**一条带
+  //      `[用户图数据]` 前缀的 user 消息。
+  //   4. 重试复用同一份快照：key 用 `${sessionId}:${turn}:${step}`
+  //      （同一次发送重试时 turn/step 不变）。
+  ctx.effect(
+    () => {
+      const onPreStep = async (payload, next) => {
+        const decision = await next()
+        try {
+          const agent = payload && payload.agent
+          const sessionId = sessionOfAgent(agent)
+          if (!sessionId) return decision
+          // 已 reject 的决策不要动（那是别人的判断）
+          if (!decision || decision.kind !== 'enter') return decision
+
+          const snapshotKey = sessionId + ':' + String(payload.turn) + ':' + String(payload.step)
+
+          // 拿到该会话的权威 overlay（读是同步的，但领域打开是异步的 → 用已就绪的句柄）
+          const domain = await readyDomain(getDomain)
+          if (!domain) return decision
+          const doc = domain.table(TABLE).get(sessionId)
+          if (!doc) return decision
+
+          const pending = pendingBySession.get(sessionId) || createPending()
+          const snapshot =
+            snapshotStore.get(snapshotKey) ||
+            rememberSnapshot(snapshotStore, snapshotKey, buildSendSnapshot(doc, pending, snapshotKey))
+
+          const rendered = renderSendInjection(doc, snapshot, {
+            derivedTitles: derivedTitleIndex(sessionId),
+          })
+          if (!rendered.text) {
+            // 没有焦点也没有粉线 → 什么都不注入（绝不塞空消息）
+            injectionLog.record(sessionId, syntheticEvent(payload, 'skip'), 'empty')
+            return decision
+          }
+
+          const injected = makeGraphContextMessage(rendered.text, {
+            sendNonce: snapshot.sendNonce,
+            focusNodeId: rendered.focusNodeId,
+            linkCount: rendered.linkCount,
+          })
+          const messages = spliceInjectionAfterClaimed(
+            decision.messages,
+            payload.messages,
+            injected,
+          )
+          injectionLog.record(sessionId, syntheticEvent(payload, 'inject'), 'injected', {
+            text: rendered.text,
+            messageId: injected.id,
+            linkCount: rendered.linkCount,
+            skippedLinks: rendered.skippedLinks,
+          })
+          return { ...decision, messages }
+        } catch (e) {
+          // 注入失败绝不能挡住这一轮对话 —— 记一条然后原样放行
+          log(ctx, 'pre-step 注入失败（已放行原决策）：' + describeError(e))
+          return decision
+        }
+      }
+
+      ctx.on('agent/pre-step', onPreStep)
+      return undefined
+    },
+    'freethought-map: send-time injection',
+  )
+
+  log(ctx, '宿主一半已激活：overlay 权威存储 + 落链 + 发送前注入（dsh 0.1.7-rc.2 c1275515）')
+}
+
+/** 每会话一份「已拍下的发送快照」，供官方重试复用（规格 §10.3）。 */
+const snapshotStore = new Map()
+
+/** 领域句柄一旦打开就复用；未就绪时返回 null（不阻塞这一轮对话）。 */
+async function readyDomain(getDomain) {
+  try {
+    return await getDomain()
+  } catch {
+    return null
+  }
+}
+
+/** 从 agent 上取会话 id。 */
+function sessionOfAgent(agent) {
+  if (!agent) return null
+  const session = agent.session
+  if (!session) return null
+  if (session.header && typeof session.header.id === 'string') return session.header.id
+  if (typeof session.id === 'string') return session.id
+  return null
+}
+
+/** 派生标题索引：从结算日志里取 eventId → 派生标题，供注入文案显示节点名。 */
+function derivedTitleIndex(sessionId) {
+  const idx = {}
+  for (const e of settlementLog.list(sessionId, -1)) {
+    if (e && e.eventId && e.title) idx[String(e.eventId)] = String(e.title)
+  }
+  return idx
+}
+
+/** 给注入日志造一条「伪事件」，复用 SettlementLog 的字段形状。 */
+function syntheticEvent(payload, phase) {
+  return {
+    type: 'freethought-map/' + phase,
+    seq: Number.isInteger(payload && payload.turn) ? payload.turn : -1,
+    data: { id: phase + ':' + String(payload && payload.turn) + ':' + String(payload && payload.step) },
+  }
 }
 
 /** 投影写入串行化：避免同一条事件被并发应用导致读-改-写交错。 */

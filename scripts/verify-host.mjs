@@ -127,6 +127,25 @@ const hostSource = readFileSync(join(root, 'src', 'host', 'storage.js'), 'utf8')
         '（说明有一侧漏登记了端点）',
     )
   }
+
+  // ⚠️ 上面那条还漏一种情况：marker 与契约都写了，但**类上根本没有这个方法体**
+  // （本轮实测撞到：加新端点时把 `events` 的方法删掉了，运行期报
+  //  `Remote marker has no prototype method "events"`，而契约断言是绿的）。
+  // 所以必须逐个确认「类上真的有这个方法」。
+  const missingBodies = markerMethods.filter(
+    (m) => !new RegExp('(^|\\s)(async\\s+)?' + m + '\\s*\\(').test(hostSource),
+  )
+  if (markerMethods.length === 0) {
+    // 上一段已经报过错了
+  } else if (missingBodies.length === 0) {
+    ok(`marker 里每个方法在类上都有方法体（${markerMethods.length} 个都验过）`)
+  } else {
+    bad(
+      'marker 声明了但类上没有方法体：' +
+        missingBodies.join(', ') +
+        '（运行期会报 Remote marker has no prototype method）',
+    )
+  }
 }
 
 if (hostSource.includes(`'${REMOTE_METHOD_DESCRIPTOR}'`)) {
@@ -406,6 +425,42 @@ if (labels.length === 0) {
     if (missing.length === 0) ok('scrollToBubble 的关键语句两侧一致（滚动 + 临时高亮 + 还原）')
     else bad('scrollToBubble 客户端版缺少：' + missing.join(' | '))
   }
+}
+
+// ── 8. 发送前注入的接线（卡 5）────────────────────────────────────────────────
+if (/ctx\.on\(\s*'agent\/pre-step'/.test(hostSource)) {
+  ok("订阅 'agent/pre-step'（发送前注入的唯一钩子）")
+} else {
+  bad("没有订阅 'agent/pre-step' —— 粉线快照与焦点摘要注入不会发生")
+}
+if (/await next\(\)/.test(hostSource)) {
+  ok('pre-step 里 await next()（不吞掉下游决策）')
+} else {
+  bad('pre-step 里没有 await next() —— 会吞掉下游 listener 的决策')
+}
+if (/\{\s*\.\.\.decision,\s*messages\s*\}/.test(hostSource)) {
+  ok('返回 { ...decision, messages } 而不是自造决策（保留 startsRequestSeries 等字段）')
+} else {
+  bad('返回决策时没有展开 decision —— 会丢掉其他字段')
+}
+// 红线：注入不得唤醒模型 / 不得改写用户原文
+{
+  const code = hostSource
+    .split(/\r?\n/)
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n')
+  if (/followup\(/.test(code)) bad('出现 followup( —— 红线：拉线/注入不得唤醒模型')
+  else ok('没有调用 followup()（红线：拉线不自动唤醒模型）')
+  if (/messages\s*\.\s*push\(|messages\s*\[[^\]]+\]\s*=/.test(code)) {
+    bad('原地改写了 messages —— pre-step 必须返回新数组，不能改原数组')
+  } else {
+    ok('没有原地改写 messages（用 spliceInjectionAfterClaimed 产新数组）')
+  }
+}
+if (/injectionLog\.record\(/.test(hostSource)) {
+  ok('注入带可观测记录（injectionLog）—— 真实发送时能从日志确认注入生效')
+} else {
+  bad('注入没有可观测记录 —— 真实发送时无法确认是否生效')
 }
 
 // ── 报告 ────────────────────────────────────────────────────────────────────
