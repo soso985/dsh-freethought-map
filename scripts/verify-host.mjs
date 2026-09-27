@@ -22,6 +22,8 @@ const root = resolve(here, '..')
 const results = []
 const ok = (m) => results.push(['PASS', m])
 const bad = (m) => results.push(['FAIL', m])
+/** 只记录不判定（用于说明"这条断言的局限"） */
+const note = (m) => results.push(['INFO', m])
 
 const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 
@@ -619,6 +621,92 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
     ok('宿主已接入探针')
   } else {
     bad('宿主没有接入探针')
+  }
+}
+
+// ── 11. rev 语义（P0，2026-09-27）──────────────────────────────────────────────
+//
+// 规格 §9.0：**任何改变权威内容的写入都必须递增 rev**。
+// 漏一处的后果不是"数字不好看"，而是**那一次写入的并发保护被关掉** ——
+// 拿着旧 doc 的客户端会通过 `baseRev === rev` 校验、整份替换、覆盖掉新内容。
+//
+// 2026-09-27 实测确认三处都漏过（自动投影 / 导入合并 / 重建投影），所以这里
+// 逐个 write site 盯住：**每个 `table.update` 的返回值都必须经过 `commitAuthorityWrite`**。
+{
+  if (/function commitAuthorityWrite\(/.test(hostSource)) {
+    ok('存在统一的权威写入收尾函数 commitAuthorityWrite')
+  } else {
+    bad('没有 commitAuthorityWrite —— rev 递增会散落在各处，容易再漏')
+  }
+  {
+    // ⚠️ 这条断言本身被变异测试抓过一次假绿：早先只查了 `if (!changed) return after`
+    //    这个**守卫**，没查真正的 `rev` 递增 —— 于是把 `rev: … + 1` 删掉，断言照样通过。
+    //    现在把函数体抽出来，逐项检查：必须真的含 `rev:` 且含 `+ 1`。
+    const start = hostSource.indexOf('function commitAuthorityWrite(')
+    const braceStart = hostSource.indexOf('{', start)
+    let depth = 0
+    let body = ''
+    for (let i = braceStart; i < hostSource.length; i += 1) {
+      const ch = hostSource[i]
+      if (ch === '{') depth += 1
+      else if (ch === '}') {
+        depth -= 1
+        if (depth === 0) {
+          body = hostSource.slice(braceStart, i + 1)
+          break
+        }
+      }
+    }
+    const flat = body.replace(/\s+/g, ' ')
+    if (!body) {
+      bad('抽不出 commitAuthorityWrite 的函数体 —— 断言失效')
+    } else if (/if \(!changed\) return after/.test(flat) && /rev:/.test(flat) && /\+\s*1/.test(flat)) {
+      ok('commitAuthorityWrite 只在 changed 时递增 rev（且函数体里确实有 rev 递增，不是空守卫）')
+    } else {
+      bad(
+        'commitAuthorityWrite 的函数体不对劲 —— 要么缺 changed 守卫，要么**根本没有 rev 递增**。' +
+          '实际：' + flat.slice(0, 200),
+      )
+    }
+  }
+
+  // ⚠️ 这条断言我改了四版，前三版**全是空断言**（靠变异测试才发现）：
+  //    1) 按 `table.update` 切 → 各站点 body 互相包含 → 摘掉一个仍能匹配到别的
+  //    2) 按 `table.update|table.put` 标记切 → 投影里的 `table.put` 把 body 截断
+  //    3) 数 `commitAuthorityWrite` 出现次数 → 注释里也有一句，计数永远是 4
+  //
+  //    教训：**"数数"证明不了"对应关系"**。要证明「每个写站点都递增 rev」，
+  //    靠源码文本匹配很脆弱。真正可靠的是**运行期验证**（见 §11b 的真机复验），
+  //    这里只保留一条最朴素的守卫：形状存在 + 站点数没变。
+  {
+    const commitReturns = (hostSource.match(/^\s*return commitAuthorityWrite\(/gm) || []).length
+    const updateSites = (hostSource.match(/await\s+table\.update\(/g) || []).length
+    if (updateSites === 0) {
+      bad('一个 table.update 站点都没找到 —— 解析逻辑失效了')
+    } else if (commitReturns >= 1) {
+      ok(
+        `存在 ${updateSites} 个 table.update 写站点，其中 ${commitReturns} 处以 ` +
+          '`return commitAuthorityWrite(...)` 收尾（注释里的引用不计）',
+      )
+      note(
+        '注意：这条只是形状守卫，**证明不了**每个站点都递增了 rev。' +
+          '真正的证据是真机复验（投影后 rev 是否变大）—— 见 docs/HOST.md §3.19',
+      )
+    } else {
+      bad('没有任何位置以 `return commitAuthorityWrite(...)` 收尾 —— rev 语义可能被整体摘掉')
+    }
+  }
+
+  // 客户端：409 之后必须能重放意图，不能只重载
+  if (/retryRef/.test(clientSource) && /intent\.kind === 'focus'/.test(clientSource)) {
+    ok('客户端 409 之后会重放本次意图（不是只重载后丢弃用户改动）')
+  } else {
+    bad('客户端 409 之后只重载 —— 用户那次点击会静默白做')
+  }
+  if (/saveAuthority\([^)]*\{ kind: 'focus', nodeId: row\.id \}/.test(clientSource)) {
+    ok('面板点击传入了意图（这样 409 才有东西可重放）')
+  } else {
+    bad('面板点击没有传意图 —— 409 时无法重放')
   }
 }
 

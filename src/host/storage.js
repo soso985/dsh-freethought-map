@@ -370,7 +370,11 @@ class FreethoughtMapHostService {
       const base = current === undefined || current === null ? createOverlay(sessionId) : current
       const r = mergeImport(base, v.doc)
       merged = r
-      return r.doc
+      // 导入改了权威内容 → 递增 rev（规格 §9.0）。判断依据用 stats：
+      // 更新/新增/隐藏项任一非零就算内容变了。
+      const st = r.stats || {}
+      const changed = (st.updated || 0) + (st.added || 0) + (st.kept || 0) + (st.hidden || 0) > 0
+      return commitAuthorityWrite(base, r.doc, changed)
     })
 
     return {
@@ -403,7 +407,9 @@ class FreethoughtMapHostService {
     await table.update(sessionId, (current) => {
       const base = current === undefined || current === null ? createOverlay(sessionId) : current
       out = rebuildProjection(base, events, { backfill })
-      return out.doc
+      // 补链新增了节点才算内容变了 → 递增 rev（规格 §9.0）。
+      // `appended === 0` 时不动 rev：空跑递增会让用户操作无谓地撞 409。
+      return commitAuthorityWrite(base, out.doc, (out.appended || 0) > 0)
     })
     return { ok: true, appended: out ? out.appended : 0, skipped: out ? out.skipped : 0, violations: out ? out.violations : [] }
   }
@@ -916,11 +922,43 @@ async function projectOne(ctx, getDomain, sessionId, event, kind) {
       focusHint = { nodeId: newNodeId, kind: plan.kind, suggested: plan.followFocus }
     }
     outcome = 'appended'
-    return projected
+    // 投影改了权威内容 → 必须递增 rev（规格 §9.0）。漏掉就等于关掉了这一次写入的
+    // 并发保护：拿着旧 doc 的客户端会通过 `baseRev === rev` 校验、整份替换、覆盖掉新节点。
+    //
+    // 写成「先算成变量、再显式 commit」的形状是**刻意的**：
+    // 这样每个写站点在源码里都是同一句 `return commitAuthorityWrite(before, next, changed)`，
+    // 断言可以逐个站点精确检查。（早先版本直接 `return projected`，
+    // 站点解析器分不清它属于哪一段，变异测试因此漏报过一次。）
+    const nextDoc = projected
+    return commitAuthorityWrite(authoritative, nextDoc, true)
   })
 
   settlementLog.record(sessionId, event, outcome)
   return { outcome, focusHint }
+}
+
+/**
+ * 权威写入的统一收尾：**内容变了就递增 rev**（规格 §9.0）。
+ *
+ * 为什么要收成一个函数：`rev` 的语义是「权威内容的修订号」，而 `save` 的并发保护
+ * 只有 `baseRev === 当前 rev` 一条判据。**任何改内容的写入漏掉递增，就等于关掉了
+ * 那一次写入的并发保护** —— 拿着旧 doc 的客户端会通过校验、整份替换、覆盖掉它。
+ *
+ * 2026-09-27 实测确认三处都漏过：自动投影（`projectOne`）、导入合并（`importDoc`）、
+ * 重建投影（`rebuild`）。所以收口在这里，并且有断言盯着「所有 `table.update` 的
+ * 返回值都经过它」。
+ *
+ * `changed === false`（内容没变）时**不**递增 —— 避免空转递增把 `rev` 变成噪声，
+ * 那会让用户操作无谓地撞 409。
+ *
+ * @param {object} before table.update 拿到的权威 doc
+ * @param {object} after  变换后的 doc
+ * @param {boolean} changed 本次是否真的改了内容
+ * @returns {object} 应当写回的 doc
+ */
+function commitAuthorityWrite(before, after, changed) {
+  if (!changed) return after
+  return { ...after, rev: (Number(before && before.rev) || 0) + 1, updatedAt: Date.now() }
 }
 
 /**

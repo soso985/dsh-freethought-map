@@ -737,10 +737,43 @@ function createPlugin(React) {
        *   - 409 冲突时**不用本地覆盖权威**，而是把权威 doc 换成返回值并提示「已从宿主重载」；
        *   - 其它失败给出可见提示（规格 §9 第 7 条：不得假装已保存）。
        */
+      /**
+       * 「按权威版本重放本次意图」这一步的实现，放在 ref 里。
+       *
+       * 为什么用 ref：`saveAuthority` 需要调用它，而它又要复用 `saveAuthority`
+       * （提交重放后的 doc）。直接互相引用会形成循环依赖。放进 ref，
+       * 每次渲染时把最新实现挂上去，`saveAuthority` 通过 ref 调用即可。
+       *
+       * 它必须**显式带上重放后的 rev** —— 不能靠 `authority.rev`：
+       * `setAuthority` 刚排队、闭包里的 `authority.rev` 还是旧值，
+       * 用它提交会立刻再撞一次 409。
+       */
+      const retryRef = useRef(null)
+
+      /**
+       * 保存到宿主权威（规格 §9）。
+       *
+       * 两条规则：
+       *   1. **409 时绝不用本地覆盖权威**（红线）。权威 doc 换成宿主返回的那份。
+       *   2. **但不能就这么算了** —— 重载等于用户那次点击白做。所以 409 之后
+       *      **把本次的改动意图重放到权威 doc 上，再提交一次**（规格 §9.0「合并」那一半）。
+       *
+       * 为什么要重放而不是重载：修好 `rev` 之后（投影也会递增 rev），
+       * 「投影刚落链、面板还是旧 rev」会变成**常态**，409 会经常发生。
+       * 只重载的话，用户点节点设焦点这件事会在有投影落地时静默失败。
+       *
+       * `intent` 描述"本次想改什么"，目前只有 focus 一种（面板点击）。形状：
+       *   `{ kind: 'focus', nodeId: string }`
+       * 传 null 表示"整份 doc 都是我算好的"（没有可重放的单一意图），此时只重载并提示。
+       *
+       * @param {object} nextDoc 要提交的 doc
+       * @param {{ kind: 'focus', nodeId: string } | null} [intent]
+       * @param {number} [overrideRev] 内部用：重放时显式指定 baseRev
+       */
       const saveAuthority = useCallback(
-        (nextDoc) => {
+        (nextDoc, intent = null, overrideRev = undefined) => {
           if (!sessionId) return
-          const baseRev = authority.rev
+          const baseRev = overrideRev === undefined ? authority.rev : overrideRev
           const ticket = ++inflight.current
           callRemote(ctx, 'save', { sessionId, doc: nextDoc, baseRev }).then(
             (r) => {
@@ -751,23 +784,39 @@ function createPlugin(React) {
               }
               const payload = r.value ?? {}
               if (payload.status === 'ok') {
-                setAuthority({ sessionId, doc: payload.doc, rev: payload.rev, status: 'ready', notice: '' })
-              } else if (payload.status === 'conflict') {
-                // 关键红线：本地不得覆盖权威。换成宿主的 doc 并让用户知道。
+                setAuthority({
+                  sessionId,
+                  doc: payload.doc,
+                  rev: payload.rev,
+                  status: 'ready',
+                  notice: overrideRev === undefined ? '' : '（接上了刚落链的节点，已按权威版本重新提交）',
+                })
+                return
+              }
+              if (payload.status === 'conflict') {
+                // 权威变了（多半是投影刚落链）。先把权威换进本地 —— 这一步保证不覆盖。
+                const canRetry = overrideRev === undefined && intent && intent.kind === 'focus'
                 setAuthority({
                   sessionId,
                   doc: payload.doc,
                   rev: payload.rev,
                   status: 'conflict',
-                  notice: '宿主数据已更新（版本 ' + String(payload.rev) + '），本地已重载，未覆盖。',
+                  notice: canRetry
+                    ? '宿主数据已更新（版本 ' + String(payload.rev) + '），正在按权威版本重新提交…'
+                    : '宿主数据已更新（版本 ' + String(payload.rev) + '），本地已重载，未覆盖。',
                 })
-              } else {
-                setAuthority((s) => ({
-                  ...s,
-                  status: 'failed',
-                  notice: '保存被拒绝：' + (payload.reason || '未知原因'),
-                }))
+                if (canRetry) {
+                  const rebased = { ...payload.doc, focusId: intent.nodeId }
+                  const fn = retryRef.current
+                  if (fn) fn(payload.rev, rebased, intent)
+                }
+                return
               }
+              setAuthority((s) => ({
+                ...s,
+                status: 'failed',
+                notice: '保存被拒绝：' + (payload.reason || '未知原因'),
+              }))
             },
             (e) => {
               if (ticket !== inflight.current) return
@@ -777,6 +826,11 @@ function createPlugin(React) {
         },
         [ctx, sessionId, authority.rev],
       )
+
+      // 把「重放提交」挂到 ref 上（见 retryRef 注释）
+      retryRef.current = (rev, rebasedDoc, intent) => {
+        saveAuthority(rebasedDoc, intent, rev)
+      }
       void saveAuthority
 
       useEffect(() => {
@@ -884,10 +938,13 @@ function createPlugin(React) {
 
       const onRowClick = (row) => {
         setHighlightId(row.id)
-        // 焦点与选中分离：这里只动本面板的高亮 + 把焦点写回权威
+        // 焦点与选中分离：这里只动本面板的高亮 + 把焦点写回权威。
+        //
+        // 第二个参数是**本次意图**：万一撞上 409（多半是投影刚落链），
+        // 客户端会把这个意图重放到权威 doc 上再提交一次 —— 而不是丢掉这次点击。
         const doc = authority.doc
         if (!doc || doc.focusId === row.id) return
-        saveAuthority({ ...doc, focusId: row.id })
+        saveAuthority({ ...doc, focusId: row.id }, { kind: 'focus', nodeId: row.id })
       }
 
       const onJumpToBubble = (row) => {
