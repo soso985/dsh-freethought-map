@@ -13,4 +13,3 @@
 - insert:
     - id: freethought-map
       name: 'dsh-freethought-map'
-      disabled: true
