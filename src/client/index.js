@@ -642,17 +642,35 @@ function createPlugin(React) {
        * 为什么从事件日志拿而不是从 overlay 拿：规格 §6.4 明写派生标题
        * **不写入 title 字段**，所以 overlay 里没有它。宿主在投影时顺手把派生标题
        * 记进事件日志（`SettlementLog`），客户端直接读 —— 两边不必各实现一遍截断规则。
+       *
+       * ⚠️ 建表必须**按 node.id**，不能按 eventId：
+       * 所有消费方（`buildChainView` / 宿主的 `displayNameOf` / `nameOf`）都用 `node.id` 查表。
+       * 早先这里返回 `eventId → title`，于是**永远查不中**，所有无注解的投影节点
+       * 一律显示成「（未命名）」—— 2026-09-27 真机抓到（注入给模型的焦点摘要因此没用）。
+       * 桥梁是节点自己的 `sourceRef.eventId`（真机核对过两者是同一个值）。
        */
       const [derivedTitles, setDerivedTitles] = useState({})
       const loadDerivedTitles = useCallback(
         (sid) => {
           if (!sid) return
-          callRemote(ctx, 'events', { sessionId: sid, sinceSeq: -1 }).then((r) => {
-            if (!r || r.ok !== true) return
-            const entries = (r.value && r.value.entries) || []
-            const idx = {}
+          // 需要 doc 才能把 eventId 映射到 node.id。并行取两样，然后按 doc 建表。
+          Promise.all([
+            callRemote(ctx, 'events', { sessionId: sid, sinceSeq: -1 }),
+            callRemote(ctx, 'load', { sessionId: sid }),
+          ]).then(([re, rl]) => {
+            const entries = re && re.ok === true && re.value ? re.value.entries || [] : []
+            const doc = rl && rl.ok === true && rl.value && rl.value.doc ? rl.value.doc : null
+            const byEvent = new Map()
             for (const e of entries) {
-              if (e && e.eventId && e.title) idx[String(e.eventId)] = String(e.title)
+              if (e && e.eventId && e.title) byEvent.set(String(e.eventId), String(e.title))
+            }
+            const idx = {}
+            if (doc && doc.nodes) {
+              for (const node of Object.values(doc.nodes)) {
+                if (!node || !node.sourceRef || !node.sourceRef.eventId) continue
+                const t = byEvent.get(String(node.sourceRef.eventId))
+                if (t) idx[node.id] = t
+              }
             }
             setDerivedTitles(idx)
           })

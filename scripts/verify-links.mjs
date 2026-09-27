@@ -13,6 +13,7 @@ import {
   MAX_LINKS_PER_SEND,
   USER_GRAPH_PREFIX,
   addFreeLink,
+  buildDerivedTitleIndex,
   buildSendSnapshot,
   consumePending,
   createPending,
@@ -347,6 +348,80 @@ test('注入插入位置：不改原数组', () => {
   const out = spliceInjectionAfterClaimed(arr, [u1], { id: 'INJ' })
   assert.deepEqual(arr.map((m) => m.id), ['U1'], '原数组必须原封不动')
   assert.equal(out.length, 2)
+})
+
+// ───────────── 派生标题索引的键（2026-09-27 真机抓到的 bug） ─────────────
+//
+// 这个 bug 的性质：事件日志按 `eventId` 建键，而所有显示名消费方按 `node.id` 查表
+// → 永远查不中 → 所有无注解的投影节点显示成「（未命名）」
+// → 注入给模型的焦点摘要变成「当前焦点：《（未命名）》」，等于没用。
+//
+// 这几条断言锁住「索引必须按 node.id」这件事。
+
+test('派生标题索引：**按 node.id 建表**（不是按 eventId）—— 曾经的键错配 bug', () => {
+  const doc = docWith({})
+  doc.nodes = {
+    'T-node-A': {
+      id: 'T-node-A',
+      kind: 'turn',
+      parentId: null,
+      position: { x: 0, y: 0 },
+      sourceRef: { kind: 'user-message', eventId: 'uuid-aaa' },
+    },
+  }
+  const entries = [{ eventId: 'uuid-aaa', title: '456', type: 'user/message' }]
+  const idx = buildDerivedTitleIndex(doc, entries)
+  assert.equal(idx['T-node-A'], '456', '必须能用 node.id 查到派生标题')
+  assert.equal(idx['uuid-aaa'], undefined, '**不得**用 eventId 作键（那正是旧 bug）')
+})
+
+test('派生标题索引：经 displayNameOf 真的能显示出原文（端到端那一步）', () => {
+  const doc = docWith({})
+  doc.nodes = {
+    'T-1': {
+      id: 'T-1',
+      kind: 'turn',
+      parentId: null,
+      position: { x: 0, y: 0 },
+      sourceRef: { kind: 'user-message', eventId: 'uuid-1' },
+    },
+  }
+  const idx = buildDerivedTitleIndex(doc, [{ eventId: 'uuid-1', title: '789' }])
+  assert.equal(
+    displayNameOf(doc.nodes['T-1'], idx),
+    '789',
+    '无注解的投影节点必须显示原文派生标题，而不是「（未命名）」',
+  )
+})
+
+test('派生标题索引：有注解时仍以注解优先；空串仍不回退', () => {
+  const doc = docWith({})
+  doc.nodes = {
+    A: { id: 'A', kind: 'turn', parentId: null, position: { x: 0, y: 0 }, title: '我的注解', sourceRef: { kind: 'user-message', eventId: 'e1' } },
+    B: { id: 'B', kind: 'turn', parentId: null, position: { x: 0, y: 0 }, title: '', sourceRef: { kind: 'user-message', eventId: 'e2' } },
+  }
+  const idx = buildDerivedTitleIndex(doc, [
+    { eventId: 'e1', title: '原文一' },
+    { eventId: 'e2', title: '原文二' },
+  ])
+  assert.equal(displayNameOf(doc.nodes.A, idx), '我的注解')
+  assert.equal(displayNameOf(doc.nodes.B, idx), '（未命名）', '空串不回退派生标题')
+})
+
+test('派生标题索引：手建节点（无 sourceRef）不进来，事件里没有的也不硬编', () => {
+  const doc = docWith({})
+  doc.nodes = {
+    M: { id: 'M', kind: 'manual', parentId: null, position: { x: 0, y: 0 } },
+    T: { id: 'T', kind: 'turn', parentId: null, position: { x: 0, y: 0 }, sourceRef: { kind: 'user-message', eventId: 'not-in-log' } },
+  }
+  const idx = buildDerivedTitleIndex(doc, [{ eventId: 'other', title: '别的' }])
+  assert.deepEqual(idx, {}, '既没有 sourceRef 也对不上的节点都不该进表')
+})
+
+test('派生标题索引：入参缺失时不抛错，返回空表', () => {
+  assert.deepEqual(buildDerivedTitleIndex(null, null), {})
+  assert.deepEqual(buildDerivedTitleIndex({ nodes: {} }, undefined), {})
+  assert.deepEqual(buildDerivedTitleIndex(undefined, [{ eventId: 'x', title: 'y' }]), {})
 })
 
 // ───────────────────────────── 报告 ─────────────────────────────

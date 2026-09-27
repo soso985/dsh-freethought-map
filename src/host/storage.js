@@ -38,7 +38,7 @@ import {
   planProjection,
   settlementKindOf,
 } from '../overlay/project.js'
-import { createPending, pendingAdd, pendingRemove } from '../overlay/links.js'
+import { createPending, pendingAdd, pendingRemove, buildDerivedTitleIndex } from '../overlay/links.js'
 import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
 import { registerReadonlyTools } from '../overlay/tools.js'
 import { appendProbeEntry, buildProbeEntry } from './hook-probe.js'
@@ -332,7 +332,7 @@ class FreethoughtMapHostService {
       }
     }
     if (kind === 'markdown') {
-      return { ok: true, kind, text: exportMarkdown(doc, { derivedTitles: derivedTitleIndex(sessionId) }) }
+      return { ok: true, kind, text: exportMarkdown(doc, { derivedTitles: derivedTitleIndex(sessionId, doc) }) }
     }
     return { ok: true, kind: 'json', text: exportJson(doc, { now: Date.now() }) }
   }
@@ -734,7 +734,7 @@ export function apply(ctx) {
             payload: { ...payload, sessionId },
             doc,
             pending: pendingBySession.get(sessionId) || createPending(),
-            derivedTitles: derivedTitleIndex(sessionId),
+            derivedTitles: derivedTitleIndex(sessionId, doc),
             snapshotStore,
           })
           probeOutcome = result.status
@@ -792,14 +792,29 @@ export function apply(ctx) {
   //      这条在 `src/overlay/tools.js` 的 `sessionIdFromExecution` 里实现并单测。
   ctx.effect(
     () => {
+      /**
+       * 只读工具的依赖。
+       *
+       * `derivedTitles` 需要 doc（见 `derivedTitleIndex` 的说明），而工具的调用序列是
+       * **先 `getDoc(sessionId)` 再 `derivedTitles(sessionId)`**（见 `overlay/tools.js` 的 `withDoc`）。
+       * 所以这里用一个「每次 getDoc 就重置」的小缓存把 doc 传过去。
+       *
+       * 为什么不用 Map 持久缓存：那会持有已删会话的 doc，白占内存；
+       * 而且工具调用是串行的，一次调用一份就够。
+       */
+      let lastDoc = null
       const count = registerReadonlyTools(ctx, {
         getDoc: async (sessionId) => {
           const domain = await readyDomain(getDomain)
-          if (!domain) return null
+          if (!domain) {
+            lastDoc = null
+            return null
+          }
           const doc = domain.table(TABLE).get(sessionId)
-          return doc === undefined ? null : doc
+          lastDoc = doc === undefined ? null : doc
+          return lastDoc
         },
-        derivedTitles: (sessionId) => derivedTitleIndex(sessionId),
+        derivedTitles: (sessionId) => derivedTitleIndex(sessionId, lastDoc),
       })
       log(ctx, '只读工具已注册（' + String(count) + ' 个，全部只读）')
       return undefined
@@ -832,13 +847,24 @@ function sessionOfAgent(agent) {
   return null
 }
 
-/** 派生标题索引：从结算日志里取 eventId → 派生标题，供注入文案显示节点名。 */
-function derivedTitleIndex(sessionId) {
-  const idx = {}
-  for (const e of settlementLog.list(sessionId, -1)) {
-    if (e && e.eventId && e.title) idx[String(e.eventId)] = String(e.title)
-  }
-  return idx
+/**
+ * 派生标题索引：**按 `node.id` 建**，值是那次结算原文的派生标题。
+ *
+ * ⚠️ 这里曾经有一个真 bug（2026-09-27 真机抓到）：早先的版本返回 `eventId → title`，
+ * 而**所有消费方都按 `node.id` 查表**
+ * （`links.js` 的 `displayNameOf`、`tools.js` 的 `nameOf`、客户端 `buildChainView`），
+ * 于是**永远查不中**，所有无注解的投影节点一律显示成 `（未命名）`。
+ * 后果很实在：注入给模型的焦点摘要变成「当前焦点：《（未命名）》」—— 基本没用。
+ *
+ * 键的换算逻辑放在 `overlay/links.js` 的 `buildDerivedTitleIndex`（纯函数、可离线断言），
+ * 这里只是把宿主的两份数据（结算日志 + 权威 doc）喂给它。
+ *
+ * @param {string} sessionId
+ * @param {import('../overlay/index.js').OverlayDoc | null | undefined} doc
+ * @returns {Record<string, string>} nodeId → 派生标题
+ */
+function derivedTitleIndex(sessionId, doc) {
+  return buildDerivedTitleIndex(doc, settlementLog.list(sessionId, -1))
 }
 
 /** 给注入日志造一条「伪事件」，复用 SettlementLog 的字段形状。 */

@@ -189,6 +189,9 @@ export function renderLinkInjection(doc, linkIds, opts = {}) {
 /**
  * 显示名三态（规格 §10.1）：注解非空用注解；注解是 `""` 用占位（**不回退派生**）；
  * 注解缺失才用派生标题。派生标题由宿主在投影时记的事件日志提供。
+ *
+ * ⚠️ `derivedTitles` 必须**按 `node.id`** 索引（不是按 eventId）。
+ * 建这个表的正确方式是 `buildDerivedTitleIndex(doc, settlementEntries)` —— 见下。
  */
 export function displayNameOf(node, derivedTitles = {}) {
   const annotated = node && node.title
@@ -198,6 +201,39 @@ export function displayNameOf(node, derivedTitles = {}) {
   }
   const d = derivedTitles[node && node.id]
   return d ? d : '（未命名）'
+}
+
+/**
+ * 把「事件日志的派生标题」翻成**按 `node.id` 索引**的表。
+ *
+ * 为什么需要这个函数（2026-09-27 真机抓到的 bug）：
+ * 事件日志（`SettlementLog`）的键是结算的 `eventId`（一个裸 uuid），
+ * 而**所有显示名消费方都按 `node.id` 查表**（`displayNameOf` 自己、
+ * `tools.js` 的 `nameOf`、客户端 `buildChainView`）。
+ * 早先直接把 `eventId → title` 当索引交出去，于是**永远查不中** ——
+ * 所有无注解的投影节点一律退化成「（未命名）」，
+ * 注入给模型的焦点摘要变成「当前焦点：《（未命名）》」，基本没用。
+ *
+ * 桥梁是节点自己的 `sourceRef.eventId`（真机核对过：与事件日志的键是同一个值）。
+ *
+ * @param {import('./index.js').OverlayDoc | null | undefined} doc
+ * @param {Array<{ eventId?: string, title?: string }>} settlementEntries 事件日志条目
+ * @returns {Record<string, string>} nodeId → 派生标题
+ */
+export function buildDerivedTitleIndex(doc, settlementEntries) {
+  const byEvent = new Map()
+  for (const e of Array.isArray(settlementEntries) ? settlementEntries : []) {
+    if (e && e.eventId && e.title) byEvent.set(String(e.eventId), String(e.title))
+  }
+  const idx = {}
+  if (doc && doc.nodes) {
+    for (const node of Object.values(doc.nodes)) {
+      if (!node || !node.sourceRef || !node.sourceRef.eventId) continue
+      const t = byEvent.get(String(node.sourceRef.eventId))
+      if (t) idx[node.id] = t
+    }
+  }
+  return idx
 }
 
 /**
