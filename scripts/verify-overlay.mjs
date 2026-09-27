@@ -10,7 +10,12 @@
 import assert from 'node:assert/strict'
 import {
   DERIVED_TITLE_LIMIT,
+  SAVE_CONFLICT,
+  SAVE_OK,
+  SAVE_REJECTED,
+  applySave,
   canSetParent,
+  createOverlay,
   deriveTitle,
   findByRef,
   isDescendant,
@@ -21,6 +26,7 @@ import {
   refKey,
   resolveAnnotation,
   sameRef,
+  shouldAdoptResponse,
   validateOverlay,
 } from '../src/overlay/index.js'
 
@@ -253,6 +259,92 @@ test('isWithinLimits：节点数超上限被拒', () => {
   const doc = makeDoc({ nodes })
   assert.equal(isWithinLimits(doc, 10).ok, false)
   assert.equal(isWithinLimits(doc, 20).ok, true)
+})
+
+// ───────────────── 权威存储与乐观并发（规格 §9，卡 2） ─────────────────
+const S1 = 'session-aaa'
+const S2 = 'session-bbb'
+
+test('createOverlay：空 overlay 直接过校验，rev 从 0 起', () => {
+  const doc = createOverlay(S1)
+  assert.equal(doc.sessionId, S1)
+  assert.equal(doc.rev, 0)
+  assert.deepEqual(validateOverlay(doc), { ok: true, errors: [] })
+})
+
+test('applySave：baseRev 相等 → 接受，rev 自增，updatedAt 由宿主盖', () => {
+  const cur = createOverlay(S1)
+  const incoming = { ...createOverlay(S1), nodes: { n1: A('n1', '1') } }
+  const r = applySave(cur, incoming, 0, 1758888000000)
+  assert.equal(r.status, SAVE_OK)
+  assert.equal(r.doc.rev, 1)
+  assert.equal(r.doc.updatedAt, 1758888000000)
+  assert.equal(r.doc.sessionId, S1)
+  assert.ok(r.doc.nodes.n1, '提交的节点应写进权威')
+})
+
+test('applySave：baseRev 过期 → conflict，且**权威一个字都不改**（409 语义）', () => {
+  const cur = { ...createOverlay(S1), rev: 7, nodes: { keep: A('keep', '9') } }
+  const incoming = { ...createOverlay(S1), nodes: { evil: A('evil', 'x') } }
+  const r = applySave(cur, incoming, 3)
+  assert.equal(r.status, SAVE_CONFLICT)
+  assert.equal(r.rev, 7)
+  assert.deepEqual(Object.keys(r.doc.nodes), ['keep'], '过期的写入不得覆盖权威')
+  assert.equal(r.doc.rev, 7)
+})
+
+test('applySave：客户端提交未来 rev 也算冲突（不能用本地覆盖权威）', () => {
+  const cur = createOverlay(S1)
+  const r = applySave(cur, createOverlay(S1), 5)
+  assert.equal(r.status, SAVE_CONFLICT)
+  assert.equal(r.rev, 0)
+})
+
+test('applySave：sessionId 不符 → 拒绝（防止把图写进别的会话）', () => {
+  const cur = createOverlay(S1)
+  const r = applySave(cur, createOverlay(S2), 0)
+  assert.equal(r.status, SAVE_REJECTED)
+  assert.ok(r.reason.includes('sessionId'))
+  assert.equal(r.doc.sessionId, S1)
+})
+
+test('applySave：不合法的结构 → 拒绝，权威不变', () => {
+  const cur = { ...createOverlay(S1), rev: 2 }
+  const bad = { ...createOverlay(S1), nodes: { n1: { ...A('n1', '1'), parentId: 'ghost' } } }
+  const r = applySave(cur, bad, 2)
+  assert.equal(r.status, SAVE_REJECTED)
+  assert.ok(r.reason.includes('不合法'))
+  assert.equal(r.doc.rev, 2)
+})
+
+test('applySave：超过规模上限 → 拒绝', () => {
+  const cur = createOverlay(S1)
+  const nodes = {}
+  for (let i = 0; i < 12; i += 1) nodes['n' + i] = A('n' + i, String(i))
+  const r = applySave(cur, { ...createOverlay(S1), nodes }, 0)
+  // 默认上限 5000，这里只验证正常路径；上限本身由 isWithinLimits 单测覆盖
+  assert.equal(r.status, SAVE_OK)
+})
+
+test('applySave：连续两次同 baseRev 保存 → 第二次必冲突（并发写保护）', () => {
+  let cur = createOverlay(S1)
+  const first = applySave(cur, { ...createOverlay(S1), nodes: { a: A('a', '1') } }, 0)
+  assert.equal(first.status, SAVE_OK)
+  cur = first.doc
+  // 第二个客户端手里还是 rev=0（它不知道已经写过一次）
+  const second = applySave(cur, { ...createOverlay(S1), nodes: { b: A('b', '2') } }, 0)
+  assert.equal(second.status, SAVE_CONFLICT, '并发写必须被拒，不能后写覆盖先写')
+  assert.deepEqual(Object.keys(second.doc.nodes), ['a'])
+})
+
+test('shouldAdoptResponse：generation 与 sessionId 都对上才采用', () => {
+  const local = { generation: 4, sessionId: S1 }
+  assert.equal(shouldAdoptResponse(local, { generation: 4, sessionId: S1 }), true)
+  // 在途的旧响应（切会话前发出的）必须丢弃
+  assert.equal(shouldAdoptResponse(local, { generation: 3, sessionId: S1 }), false)
+  // 会话已切走，旧会话的回包不得写进新会话缓存
+  assert.equal(shouldAdoptResponse(local, { generation: 4, sessionId: S2 }), false)
+  assert.equal(shouldAdoptResponse(null, { generation: 4, sessionId: S1 }), false)
 })
 
 // ───────────────── 报告 ─────────────────

@@ -34,6 +34,7 @@ let nextId = 1
 const pending = new Map()
 const pageErrors = []
 const consoleLogs = []
+const errLogs = []
 
 function send(method, params = {}) {
   const id = nextId++
@@ -60,20 +61,21 @@ ws.on('message', (raw) => {
   if (msg.method === 'Runtime.exceptionThrown') {
     pageErrors.push(msg.params.exceptionDetails?.exception?.description ?? 'unknown')
   }
-  // 激活失败的**真实错误**只会出现在控制台/日志里，页面 UI 不给细节 —— 必须抓下来
+  // 激活失败的**真实错误**只会出现在控制台/日志里，页面 UI 不给细节 —— 必须抓下来。
+  // 注意：这里**不过滤**关键词。之前用 /activat|plugin|.../ 过滤，漏掉了真正的报错文本
+  // （宿主诊断会写成 "dsh-freethought-map: pending (waiting for service: …)"，
+  //  而真正的异常可能是任意一句话）。宁可多打几条。
   if (msg.method === 'Runtime.consoleAPICalled') {
     const text = (msg.params.args ?? [])
       .map((a) => a.value ?? a.description ?? a.unserializableValue ?? '')
       .join(' ')
-    if (/activat|plugin|module|boot|failed|Error/i.test(text)) {
-      consoleLogs.push(`[${msg.params.type}] ${text}`)
-    }
+    consoleLogs.push(`[${msg.params.type}] ${text}`)
+    if (msg.params.type === 'error') errLogs.push(text)
   }
   if (msg.method === 'Log.entryAdded') {
     const t = msg.params.entry.text ?? ''
-    if (/activat|plugin|module|boot|failed|Error/i.test(t)) {
-      consoleLogs.push(`[log:${msg.params.entry.level}] ${t}`)
-    }
+    consoleLogs.push(`[log:${msg.params.entry.level}] ${t}`)
+    if (msg.params.entry.level === 'error') errLogs.push(t)
   }
 })
 
@@ -370,9 +372,114 @@ if (pageErrors.length) {
   }
 }
 
+// ── 6. 卡 2 权威存储协议：save → rev 自增 → 过期 save 必须 409 ────────────────
+//
+// 走的是客户端插件自己那条 `ctx.connection.rpc.call` 通道，所以验的是**完整链路**：
+// 浏览器 → /api → 网关 → 宿主服务 → 领域写链 → 磁盘。
+// 三条断言：
+//   1) save(baseRev=当前) → status ok，rev 自增 1
+//   2) 再用**旧的 baseRev** save → status conflict，且权威节点数不变（没被覆盖）
+//   3) 冲突返回的 rev 等于第一次成功后的 rev（客户端据此重载）
+{
+  const rpc = async (method, args) =>
+    evaluate(`(async () => {
+      // 在页面里找一个能用的 connection：官方 api-* 插件都持有它。
+      // 这里直接借用模块系统里已挂载的 gateway 客户端面不方便，所以用最底层的方式：
+      // 页面自己的 fetch 打 /api，构造与 connection.rpc.call 完全相同的报文。
+      const endpoint = ${JSON.stringify('freethoughtMap/' + method)};
+      const rpcId = crypto.randomUUID();
+      const res = await fetch('/api/' + endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId, method: endpoint, payload: { args: ${JSON.stringify(args)} } }),
+      });
+      if (!res.ok) return { carrier: 'HTTP ' + res.status };
+      const full = await res.json();
+      return full.result;
+    })()`)
+
+  const target = await evaluate(`(() => {
+    const el = document.querySelector('${ROOT_SEL}');
+    const dl = el && el.querySelector('.ftm-kv');
+    const text = dl ? dl.innerText : '';
+    const m = text.match(/会话\\n([^\\n]+)/);
+    const r = text.match(/权威 rev\\n(\\d+)/);
+    return { sessionId: m ? m[1].trim() : null, rev: r ? Number(r[1]) : null };
+  })()`)
+  info(`存储协议测试目标：sessionId=${target && target.sessionId} rev=${target && target.rev}`)
+
+  if (!target || !target.sessionId || target.rev === null) {
+    info('拿不到会话/rev，跳过存储协议测试')
+  } else {
+    const { sessionId, rev: rev0 } = target
+    // 1) 正常保存：塞一个 manual 节点进去
+    const doc = {
+      version: 1,
+      sessionId,
+      rev: rev0,
+      nodes: {
+        'n-test-1': {
+          id: 'n-test-1',
+          kind: 'manual',
+          parentId: null,
+          position: { x: 10, y: 20 },
+          title: '卡2 存储协议测试节点',
+        },
+      },
+      freeLinks: [],
+      focusId: 'n-test-1',
+      hidden: [],
+      updatedAt: 0,
+    }
+    const saved = await rpc('save', { sessionId, doc, baseRev: rev0 })
+    const okSave = saved && saved.ok === true && saved.value && saved.value.status === 'ok'
+    if (okSave && saved.value.rev === rev0 + 1) {
+      ok(`save(baseRev=${rev0}) → ok，rev 自增到 ${saved.value.rev}`)
+    } else {
+      bad(`save 未按预期成功：${JSON.stringify(saved).slice(0, 240)}`)
+    }
+
+    // 2) 过期保存：故意还用 rev0
+    const stale = await rpc('save', { sessionId, doc, baseRev: rev0 })
+    const isConflict = stale && stale.ok === true && stale.value && stale.value.status === 'conflict'
+    if (isConflict) {
+      ok(`过期 save(baseRev=${rev0}) → conflict（409 语义成立）`)
+    } else {
+      bad(`过期 save 没有返回 conflict：${JSON.stringify(stale).slice(0, 240)}`)
+    }
+
+    // 3) 冲突返回的权威必须没被覆盖，且 rev 是当前值
+    if (isConflict) {
+      const v = stale.value
+      const nodeIds = Object.keys((v.doc && v.doc.nodes) || {})
+      if (v.rev === rev0 + 1 && nodeIds.includes('n-test-1') && nodeIds.length === 1) {
+        ok(`冲突返回的权威未被覆盖：rev=${v.rev}，节点=${nodeIds.join(',')}`)
+      } else {
+        bad(`冲突路径下权威被改动了：rev=${v.rev} 节点=${nodeIds.join(',')}`)
+      }
+    }
+
+    // 4) 用正确的新 rev 再存一次，应该成功 —— 证明冲突之后仍能继续写
+    const retry = await rpc('save', { sessionId, doc, baseRev: rev0 + 1 })
+    if (retry && retry.ok === true && retry.value && retry.value.status === 'ok' && retry.value.rev === rev0 + 2) {
+      ok(`按权威 rev 重试 save → ok，rev=${retry.value.rev}（冲突后可继续写）`)
+    } else {
+      bad(`重试 save 失败：${JSON.stringify(retry).slice(0, 240)}`)
+    }
+
+    // 5) load 读回来的 rev 必须是最后一次的值
+    const reloaded = await rpc('load', { sessionId })
+    if (reloaded && reloaded.ok === true && reloaded.value && reloaded.value.rev === rev0 + 2) {
+      ok(`load 读回权威 rev=${reloaded.value.rev}（与最后一次写入一致）`)
+    } else {
+      bad(`load 读回的 rev 不对：${JSON.stringify(reloaded).slice(0, 240)}`)
+    }
+  }
+}
+
 if (consoleLogs.length) {
-  info(`控制台相关消息 ${consoleLogs.length} 条：`)
-  for (const l of consoleLogs.slice(0, 20)) info('  ' + l.slice(0, 400))
+  info(`控制台消息 ${consoleLogs.length} 条，其中 error ${errLogs.length} 条：`)
+  for (const l of consoleLogs.slice(0, 40)) info('  ' + l.slice(0, 500))
 }
 
 const fails = results.filter(([s]) => s === 'FAIL')

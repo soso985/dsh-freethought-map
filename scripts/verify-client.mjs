@@ -200,7 +200,7 @@ try {
 if (typeof plugin?.apply === 'function') ok('factory 返回带 apply() 的插件面')
 else bad('factory 没有返回 apply()')
 
-const expectedInject = ['slots', 'sidebarRight', 'sidebarRightTabs']
+const expectedInject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'connection']
 const got = plugin?.inject ?? []
 if (JSON.stringify([...got].sort()) === JSON.stringify([...expectedInject].sort())) {
   ok(`运行时 inject = ${JSON.stringify(got)}`)

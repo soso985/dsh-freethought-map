@@ -378,6 +378,34 @@ Node 的 `fetch` **不会**自动保存 cookie，必须自己接住 303 的 `set
 | 官方行的 DOM 标记（装饰用，**非公开契约**） | `data-chat-node-key` / `data-chat-anchor-key` / `data-chat-flow-key` / `data-chat-flow-kind` / `data-chat-turn` / `data-chat-group-part` | `dsh-client-ui-chat/lib/client.js:1757-1778` |
 | 官方行的 class **不可依赖** | 来自 CSS module 哈希（如 `fq8vsa_flowItem`） | `dsh-client-ui-chat/lib/client.js:1630,1759` |
 
+### 3.9 插件包解析与自包含约束（卡 2 实测，很重要）
+
+| 约定 | 内容 | 证据 |
+| --- | --- | --- |
+| **宿主 runtime 解析不到任何裸包名** | `E:\Harness\resources\app.asar.unpacked\dsh\node_modules` 里只有 **3 个** `@deepseek-ai` 包；`createRequire` 从该目录解析 `@deepseek-ai/dsh-storage-domain` / `dsh-storage` / `cordis` / `zod` / `schemastery` **全部 `MODULE_NOT_FOUND`** | 本机实测 |
+| **profile 的 node_modules 大面积失效** | `~/.dsh/profiles/node_modules` 顶层 295 个条目里 **265 个**是指向 `E:\Harness\DSH Desktop\…`（**该路径不存在**）的失效 junction。从 `profiles/web/package.json` 解析 `zod` / `@deepseek-ai/*` 同样全部失败 | 本机实测 |
+| → **结论：插件必须自包含** | 宿主一半**只 import 相对路径**，不 import 任何裸包名。需要领域层/协议层的形状时**手写等价对象**（鸭子类型），并在自测里断言形状 | `scripts/verify-host.mjs` 的「只 import 相对路径」断言 |
+| 领域层只调用 schema 的 `parse()` | `dsh-storage-domain/lib/index.js:371` 用 `valueSchema.parse(raw)` 校验记录；`safeParse` 只在 `global` schema 上用（`:74`）。所以手写的记录 schema 只要有 `parse()` 就够 | 源码 |
+| **`defineDomain` 只是校验 + 恒等** | `dsh-storage-domain/lib/index.js:61-90`：校验名字/版本/global 不接受 null，然后**原样返回 spec**。手写 spec 不需要这个函数 | 源码 |
+| **单元名正则不允许连字符** | `/^[a-z][a-z0-9_]*$/`（`dsh-storage/lib/index.js:80`）。名字带连字符时 json 后端抛 `malformed-medium: invalid unit name '…'`（`dsh-storage-json/lib/index.js:590`）。**实测踩过**：`freethought-map` → 改名 `freethought_map` | 源码 + 本机实测 |
+| **Cordis 不允许访问未声明的服务属性** | `ctx.xxx` 在 `xxx` 没写进 `inject` 时直接抛 `cannot get property "xxx" without inject`。而 `apply()` 里的异常 = **整行激活失败 = 整个 Web 前端拒绝加载**。本轮实测连踩三次：`shortcuts`、`storageDomain`、`remote` | 宿主日志 + 浏览器控制台 |
+| 领域落盘位置 | `<root>/<unit>.json`（`single` 布局）。实测路径：`C:\Users\Administrator\.dsh\storages\freethought_map.json` | 本机实测 |
+
+### 3.10 Host↔Client 数据通道（卡 2 选型）
+
+| 方案 | 形状 | 结论 |
+| --- | --- | --- |
+| **直连传输（采用）** | 客户端 `ctx.connection.rpc.call('/api', '<ns>/<method>', { args }, signal)` → 返回官方 `RemoteResult`：`{ok:true,value}` \| `{ok:false,error:{code,message}}`。`connection` 由 `dsh-client-connection/lib/client.js:1477` 的 `ctx.provide("connection", …)` 提供 | **采用**。这是 `dsh-api-gateway` 客户端面**自己用的**同一条路（`dsh-api-gateway/lib/client.js:1792`），只依赖一个服务、无挂载时序耦合 |
+| 高层 `ctx.remote.<ns>.<method>()` | 需要先把描述符 `$mount` 进 `ctx.remote`；且要写 `remote` 与 `remote.<ns>` 两个 inject | **不采用**。实测：`ctx.remote` 未 inject → `cannot get property "remote" without inject`；`ctx.remote.freethoughtMap` 未挂载 → `cannot get property "remote.freethoughtMap" without inject`。两处都会让**整个 UI 打不开** |
+| 匿名 contributor 描述符 | `{package, descriptors:[{id,service,namespace,method,invocation:{kind:'direct'},parameters:[…],result:{mode:'src-json'}}]}` | 形状已核对并在 `scripts/verify-host.mjs` 里做两侧一致性断言；将来若要走高层形态可直接用 |
+
+**宿主端点的手写方式**（网关的 SRC 发现，`dsh-api-gateway/lib/index.js:698-711` 只认这三样）：
+1. 服务经 `ctx.reflect.provide(key, instance)` 登记成 `type === "service"` 的条目；
+2. 实例上有 `typertRemote = Object.freeze({ service, serviceKey, namespace })`；
+3. 类原型上有 marker：`Object.defineProperty(proto, '@deepseek-ai/dsh-typert-protocol/remote-methods', { value: Object.freeze({ version: 1, methods: Object.freeze([{ method, invocation: Object.freeze({ kind: 'direct' }) }]) }) })`。
+
+**坑**：网关用 `Function.prototype.toString` 解析**参数名**当 wire 字段名（`dsh-api-gateway/lib/index.js:1458-1484`），所以被标记的方法参数**只能是简单标识符**（不能有默认值/解构/剩余参数），且参数名即客户端契约。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
@@ -396,3 +424,4 @@ Node 的 `fetch` **不会**自动保存 cookie，必须自己接住 303 的 `set
 | 2026-09-27 | 卡 1：四路只读侦察把 §3 的宿主约定从 8 条扩到 **40+ 条**（含 P1–P4 的源码级结论）；新增 §2.1–§2.5 探针明细；P5 装机实测 10/10 通过；记录两个坑（宿主行必须启用、客户端 bundle 禁 `export`） | 见各小节证据列；脚本 `verify-boot.mjs` / `verify-render.ps1` |
 | 2026-09-27 | 布局朝向经主人批复修正：规格 §4 由「左图右聊」改为「**中聊右图**」，并同步进 `docs/01-产品与技术规格.md` §4.1 | 主人当面批复（本会话） |
 | 2026-09-27 | **卡 1 收口**：新增 §2.6 真浏览器运行期实测（D1-1 / D1-2 / D1-4 硬证据）；探针表 P1、P5 升为「运行期实测通过」；记录三个运行期踩坑（宿主行须启用、客户端 bundle 禁 export、inject 服务名写错会让整个 Web UI 打不开） | `scripts/verify-session.ps1` 10/10 等五套脚本；真浏览器控制台洁净 |
+| 2026-09-27 | **卡 2 收口**：新增 §3.9（插件包解析与自包含约束）与 §3.10（Host↔Client 数据通道选型）。实测打通 overlay 权威存储：领域 `freethought_map` 落盘、`load/save` 走通、**过期 save 返回 conflict 且权威未被覆盖**。又踩两个坑：单元名不允许连字符（`freethought-map` → `freethought_map`）；`remote` 与 `remote.<ns>` 未 inject 会抛并让整个 UI 打不开 → 改用直连传输 | `scripts/verify-session.ps1` 15/15；`C:\Users\Administrator\.dsh\storages\freethought_map.json` 实盘核对 |

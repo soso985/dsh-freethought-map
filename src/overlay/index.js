@@ -331,3 +331,120 @@ export function isWithinLimits(doc, maxNodes = 5000) {
   if (bytes > MAX_BYTES) return { ok: false, reason: `JSON ${bytes} 字节超过上限 ${MAX_BYTES}` }
   return { ok: true }
 }
+
+// ───────────────────────────── 权威存储与乐观并发（规格 §9） ─────────────────────────────
+//
+// 背景（探针查实，见 docs/HOST.md §3.6）：宿主的 `ctx.storageDomain` **没有任何内建乐观
+// 并发** —— 既无 CAS 也无 revision，只有「每个领域一条写链」做串行化，后写覆盖先写。
+// 所以规格 §9 要求的 `rev` + 409 必须**由本插件自己实现**：把 rev 存在记录里，
+// 每次 save 在写链的同一个槽位里比对。
+//
+// 这一节就是那部分逻辑的纯函数形态，便于单测（宿主与客户端两侧都调它）。
+
+/** 服务端把写入结果归为三类：成功 / 版本过期（409）/ 拒绝。 */
+export const SAVE_OK = 'ok'
+export const SAVE_CONFLICT = 'conflict'
+export const SAVE_REJECTED = 'rejected'
+
+/**
+ * 为某个会话铸造一份空的权威 overlay。
+ *
+ * 权威记录与客户端草稿的区别：**权威记录是完整的 OverlayDoc**（带 `rev`），
+ * 直接过 `validateOverlay`，不做字段删减 —— 少一层「存储形状 vs 文档形状」的翻译，
+ * 就少一处能把两者写分叉的地方。
+ *
+ * @param {string} sessionId
+ * @returns {OverlayDoc}
+ */
+export function createOverlay(sessionId) {
+  return {
+    version: OVERLAY_VERSION,
+    sessionId,
+    rev: 0,
+    nodes: {},
+    freeLinks: [],
+    focusId: null,
+    hidden: [],
+    updatedAt: 0,
+  }
+}
+
+/**
+ * 乐观并发保存（规格 §9 第 3 条）。
+ *
+ * 契约：
+ *   - `baseRev === 当前 rev` → 接受。写入 `doc` 的**结构字段**，`rev` 自增，`updatedAt` 由宿主盖。
+ *   - `baseRev !== 当前 rev` → **409 过期**。**不写入**，返回权威 doc + 当前 rev，
+ *     由客户端决定「重载」还是「提示用户」，**绝不允许客户端用本地覆盖权威**。
+ *   - `doc.sessionId` 与记录不一致 → 拒绝（防止写错会话的图）。
+ *   - `doc` 过不了 `validateOverlay` / `isWithinLimits` → 拒绝，且权威保持不变。
+ *
+ * 注意：调用方必须保证「读当前 → 比对 → 写回」在**同一个写链槽位**里完成，
+ * 否则两个并发 save 会双双通过比对。宿主领域层的 `table.update(key, fn)` 正好提供这个槽位
+ * （README：「`update` 的变换在链上自己的槽位运行，因此并发更新绝不会交错」）。
+ *
+ * @param {OverlayDoc} current  权威记录（调用方从 table.get 拿到的）
+ * @param {any} incoming        客户端提交的 doc
+ * @param {number} baseRev      客户端认为的当前版本号
+ * @param {number} [now]        注入时间戳，便于测试
+ * @returns {{ status: 'ok', doc: OverlayDoc } | { status: 'conflict', doc: OverlayDoc, rev: number } | { status: 'rejected', reason: string, doc: OverlayDoc }}
+ */
+export function applySave(current, incoming, baseRev, now = Date.now()) {
+  // 1. 会话必须对得上 —— 写错会话的图是数据事故，直接拒绝
+  if (!incoming || typeof incoming !== 'object') {
+    return { status: SAVE_REJECTED, reason: '入参不是对象', doc: current }
+  }
+  if (incoming.sessionId !== current.sessionId) {
+    return {
+      status: SAVE_REJECTED,
+      reason: `sessionId 不符：提交 ${JSON.stringify(incoming.sessionId)}，权威 ${JSON.stringify(current.sessionId)}`,
+      doc: current,
+    }
+  }
+
+  // 2. 版本过期 → 409，权威不动（客户端不得覆盖）
+  if (baseRev !== current.rev) {
+    return { status: SAVE_CONFLICT, doc: current, rev: current.rev }
+  }
+
+  // 3. 结构必须合法 —— 脏数据不进权威
+  const candidate = {
+    version: OVERLAY_VERSION,
+    sessionId: current.sessionId,
+    rev: current.rev + 1,
+    nodes: incoming.nodes ?? {},
+    freeLinks: incoming.freeLinks ?? [],
+    focusId: incoming.focusId ?? null,
+    hidden: incoming.hidden ?? [],
+    updatedAt: now,
+  }
+
+  const check = validateOverlay(candidate)
+  if (!check.ok) {
+    return { status: SAVE_REJECTED, reason: `overlay 不合法：${check.errors.slice(0, 3).join('；')}`, doc: current }
+  }
+  const limit = isWithinLimits(candidate)
+  if (!limit.ok) {
+    return { status: SAVE_REJECTED, reason: limit.reason, doc: current }
+  }
+
+  return { status: SAVE_OK, doc: candidate }
+}
+
+/**
+ * 客户端拿到 `{ doc, rev }` 之后该不该覆盖本地缓存（规格 §9 第 2、5 条）。
+ *
+ * 切会话时会有在途响应回来：必须用 generation 判别，**过期的响应整包丢弃**，
+ * 不能写进新会话的缓存。这也是「未完成的 save 若 session 已切走则丢弃回包」同一条规则。
+ *
+ * @param {{ generation: number, sessionId: string | null }} local
+ * @param {{ generation: number, sessionId: string }} response
+ * @returns {boolean} true = 可以采用
+ */
+export function shouldAdoptResponse(local, response) {
+  if (!local || !response) return false
+  if (local.generation !== response.generation) return false
+  if (local.sessionId !== response.sessionId) return false
+  return true
+}
+

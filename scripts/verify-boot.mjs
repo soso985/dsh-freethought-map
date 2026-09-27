@@ -111,6 +111,17 @@ if (html) {
       else bad('本包不在任何 batch 的 entries 里')
     }
   }
+
+  // 启动页面上如果出现 "Failed to load plugins"，说明有行没激活。
+  // 宿主前端的诊断函数会把原因写成 "<包名>: pending (waiting for service: …)" 或 "<包名>: failed"
+  // —— 那串文本就是唯一能定位原因的线索，必须抓出来（本轮踩过两次）。
+  if (html.includes('Failed to load plugins')) {
+    bad('启动页面显示 "Failed to load plugins" —— 有插件行没激活')
+    const reasons = [...html.matchAll(new RegExp(`${PKG_NAME}[^<\\n]{0,200}`, 'g'))].map((m) => m[0])
+    for (const r of reasons.slice(0, 5)) bad('  宿主诊断：' + r.trim())
+  } else {
+    ok('启动页面没有 "Failed to load plugins"')
+  }
 }
 
 // ── 3. bundle 可取 ───────────────────────────────────────────────────────
