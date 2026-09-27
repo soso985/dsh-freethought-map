@@ -552,6 +552,30 @@ return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
 **宿主实测信号**：`inject` 里写错服务名会让整个 Web UI 拒绝加载（卡 1/2 各踩过一次），
 所以「UI 正常加载」本身就是 `tools` 服务解析成功 + 注册路径跑通的证据。
 
+### 3.16 撤销栈的两条不变量（卡 7）
+
+规格 §7 里有两条规则**极易写错**，所以它们被做成了结构上的保证而不是"记得这么做"：
+
+| 规则 | 做法 | 断言 |
+| --- | --- | --- |
+| **只逆转用户操作，绝不碰投影** | 历史里存的是**逆操作**，不是整份 doc 快照（规格明令禁止 v0.1 的 beginEdit 式快照） | 拖动期间到达的 AI 投影，撤销拖动**不得删掉它**；`undo.js` 里不得出现整份 doc 快照 |
+| **undo 绝不新建节点** | `redoInverseOf` 只产出 `remove` / `restore-node` / `unremove` / `set-field` / link 这几类，**结构上不可能**新建 | 操作种类白名单断言 |
+
+**「前值」必须由 op 自己带着**（`op.before`），不能从 doc 现读 —— 调用 `invertOp` 时
+`doc` 已经是操作**之后**的状态，现读会把新值当旧值。这是标准 operation-log 的做法，
+也是本轮 4 个真 bug 里最隐蔽的一个（撤销拖动会把节点挪到拖动后的位置）。
+
+**undo/redo 对称的关键**：`redoInverseOf(inv)` 直接按类型配对，**不依赖 doc**。
+不要走「翻译回 op → 再拿操作后的 doc 重算逆操作」那条路 ——
+`remove` 应用完节点就没了，重算只会得到 null，redo 栈永远是空的。
+
+**为什么 `canSetParent` 用注入而不是 import**：客户端 bundle 不能 import 相对模块，
+而 undo.js 两侧都要用。宿主在 `apply()` 里 `setCanSetParent(canSetParent)`，
+断言检查两边都接上了 —— 防环只有一份实现，不重复写。
+
+**变异测试**：把 `redoInverseOf` 的 remove 分支故意打回原形，40 条断言立刻红 3 条；
+恢复后全绿。说明这些断言真的在咬。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
