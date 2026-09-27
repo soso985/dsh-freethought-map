@@ -125,6 +125,12 @@ const sandboxWindow = {
   },
   addEventListener() {},
   removeEventListener() {},
+  // 组件与 apply() 里用的是 `window.setInterval` / `window.setTimeout`，
+  // 所以这两个也必须在 window 上（Node 的全局同名函数不算）。
+  setInterval,
+  clearInterval,
+  setTimeout,
+  clearTimeout,
   __ModuleLoader__: {
     mode: 'queue',
     load(reg) {
@@ -134,7 +140,14 @@ const sandboxWindow = {
   },
 }
 
-const sandbox = { window: sandboxWindow, console, setTimeout, clearTimeout }
+const sandbox = {
+  window: sandboxWindow,
+  console,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+}
 try {
   vm.createContext(sandbox)
   new vm.Script(clientSource, { filename: clientPath }).runInContext(sandbox)
@@ -195,9 +208,29 @@ if (JSON.stringify([...got].sort()) === JSON.stringify([...expectedInject].sort(
   bad(`运行时 inject = ${JSON.stringify(got)}，期望 ${JSON.stringify(expectedInject)}`)
 }
 
+// 客户端源码不得挂全局键盘监听（规格 §5：禁止长期 window 全局 listener 不检查 target）
+// 注意先去掉注释行 —— 文件顶部有一段解释「为什么不用 window.addEventListener('keydown')」
+// 的说明文字，直接 grep 会把它当成真实代码误报（本轮踩过）。
+const codeOnly = clientSource
+  .split(/\r?\n/)
+  .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+  .join('\n')
+const windowKeyListeners = (codeOnly.match(/window\.addEventListener\(\s*['"]key/g) ?? []).length
+if (windowKeyListeners === 0) {
+  ok('真实代码里没有 window 级 keydown/keyup 监听（键盘隔离的红线）')
+} else {
+  bad(`代码里有 ${windowKeyListeners} 处 window 级键盘监听 —— 会污染宿主`)
+}
+// 指针监听允许挂在 window 上（拖动改宽需要），但必须成对 add/remove
+const pointerAdd = (codeOnly.match(/window\.addEventListener\(\s*['"]pointer/g) ?? []).length
+const pointerRemove = (codeOnly.match(/window\.removeEventListener\(\s*['"]pointer/g) ?? []).length
+if (pointerAdd === pointerRemove) ok(`window 指针监听成对（add ${pointerAdd} / remove ${pointerRemove}）`)
+else bad(`window 指针监听不成对：add ${pointerAdd} / remove ${pointerRemove}`)
+
 // ── 跑 apply(ctx)，记录登记了什么 ────────────────────────────────────────────
 const slotRegistrations = []
 const tabTypeRegistrations = []
+const shortcutRegistrations = []
 const effects = []
 
 const ctx = {
@@ -208,6 +241,12 @@ const ctx = {
   sidebarRightTabs: {
     register(decl) {
       tabTypeRegistrations.push(decl)
+      return () => {}
+    },
+  },
+  shortcuts: {
+    register(decl) {
+      shortcutRegistrations.push(decl)
       return () => {}
     },
   },
@@ -277,6 +316,27 @@ if (slotRegistrations.some((r) => r.viaInject === 'sidebar.right.pane.tab')) {
   ok('用 ctx.slots.inject 等 sidebar.right.pane.tab 被声明（不是直接注册）')
 } else {
   bad('没有对 sidebar.right.pane.tab 做 slots.inject')
+}
+
+// ── 快捷键隔离（卡 1 验收项 D1-4）─────────────────────────────────────────────
+// 卡 1 的结论是「**不向宿主注册任何全局快捷键**」：唯一的键盘监听挂在面板根节点上。
+// 所以这里断言的是"没有全局登记"，而不是"登记得对不对"。
+if (shortcutRegistrations.length === 0) {
+  ok('没有向宿主的快捷键注册表登记任何命令（隔离取向：不抢宿主键位）')
+} else {
+  bad(`向宿主登记了 ${shortcutRegistrations.length} 条快捷键 —— 卡 1 决定不这么做`)
+}
+
+// 自动打开 tab 的 effect 必须存在，且必须有清理函数（否则会话切换时定时器泄漏）
+const hasAutoOpen = effects.some((l) => String(l).includes('auto-open'))
+if (hasAutoOpen) ok('有「首次出现时打开一次」的 effect（D1-1 靠它才能自动展开）')
+else bad('缺少自动打开 tab 的 effect —— 用户看不到面板')
+
+// 组件里必须自己挂 keydown（而不是 window）
+if (/addEventListener\(\s*['"]keydown/.test(clientSource)) {
+  ok('组件里用 addEventListener("keydown") 挂按键处理')
+} else {
+  bad('组件里没有 keydown 处理 —— 面板内快捷键不会生效')
 }
 
 // ── 渲染组件 ─────────────────────────────────────────────────────────────────

@@ -40,6 +40,12 @@ const PANEL_WIDTH_MAX = 900
 const DSH_VERSION = '0.1.7-rc.2'
 const DSH_COMMIT = 'c1275515'
 
+/**
+ * 「首次出现时自动打开本插件的 tab」的一次性开关。
+ * 存成 localStorage 标记：用户关掉这次打开的 tab 之后，刷新不会再强行弹回来。
+ */
+const AUTOPEN_KEY = 'freethought-map:autopen-done:v1'
+
 function clampWidth(value) {
   const n = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(n)) return PANEL_WIDTH_DEFAULT
@@ -110,6 +116,10 @@ function createPlugin(React) {
   z-index: 2;
 }
 [${ROOT_ATTR}] .ftm-resizer:hover { background: var(--dsw-alias-bg-hover, rgba(128, 128, 128, 0.18)); }
+[${ROOT_ATTR}][data-collapsed='1'] { overflow: hidden; min-width: 0; }
+[${ROOT_ATTR}][data-collapsed='1'] .ftm-resizer { display: none; }
+/* 只收起正文，保留标题栏与按钮 —— 否则用户没有回到展开态的路 */
+[${ROOT_ATTR}][data-collapsed='1'] .ftm-body { display: none; }
 `
 
   function StyleTag() {
@@ -144,11 +154,18 @@ function createPlugin(React) {
   }
 
   // ───────────────────────────── 探针面板 ─────────────────────────────
-  function makePanel(ctx) {
+  /**
+   * @param {any} ctx
+   * @param {{ current: null | (() => void) }} toggleRef
+   *   面板把「收起/展开」的实现挂进来，`apply()` 里的快捷键 handler 直接调用。
+   *   这样快捷键**不需要**去点 DOM、也不需要面板持有焦点，仍然只作用于插件自己。
+   */
+  function makePanel(ctx, toggleRef) {
     return function FreeThoughtMapPanel() {
       const [width, setWidth] = useState(readStoredWidth)
       const [collapsed, setCollapsed] = useState(readStoredCollapsed)
       const drag = useRef(null)
+      const rootRef = useRef(null)
 
       useEffect(() => {
         write(WIDTH_KEY, width)
@@ -156,6 +173,39 @@ function createPlugin(React) {
       useEffect(() => {
         write(COLLAPSED_KEY, collapsed ? 1 : 0)
       }, [collapsed])
+
+      // 把切换实现交给 apply() 的快捷键 handler；组件卸载时摘掉，避免调用已卸载的 setState。
+      useEffect(() => {
+        toggleRef.current = () => setCollapsed((v) => !v)
+        return () => {
+          toggleRef.current = null
+        }
+      }, [toggleRef])
+
+      /**
+       * **唯一的键盘监听**：挂在面板根节点自己身上。
+       *
+       * 为什么不是 `window.addEventListener('keydown', …)`：
+       * 规格 `01-产品与技术规格.md` §5 明令「禁止长期 window 全局 listener 不检查 target」；
+       * 挂在根节点上，事件只在面板内部冒泡时才会到这里，宿主与官方输入框完全不受影响。
+       * 这也是卡 1 的验收项 D1-4（官方输入框 Enter 仍能发送）。
+       */
+      useEffect(() => {
+        const el = rootRef.current
+        if (!el) return undefined
+        const onKeyDown = (e) => {
+          if (e.key !== 'm' && e.key !== 'M') return
+          if (!(e.ctrlKey || e.metaKey) || !e.altKey) return
+          const t = e.target
+          // 打字时不抢键（与线 A 的 useHotkeys 同一条纪律）
+          if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return
+          e.preventDefault()
+          e.stopPropagation()
+          setCollapsed((v) => !v)
+        }
+        el.addEventListener('keydown', onKeyDown)
+        return () => el.removeEventListener('keydown', onKeyDown)
+      }, [])
 
       // 拖动改宽：监听器在指针按下时才挂，松手即卸；只影响本插件根节点内的盒宽。
       const onPointerDown = useCallback(
@@ -246,8 +296,12 @@ function createPlugin(React) {
       return h(
         'div',
         {
+          ref: rootRef,
           [ROOT_ATTR]: '',
           'data-collapsed': collapsed ? '1' : '0',
+          // tabIndex=-1：面板可以被程序化聚焦，从而让挂在根上的 keydown 生效；
+          // 但不进入 Tab 顺序，不会打断宿主自己的焦点流。
+          tabIndex: -1,
           style: { position: 'relative', height: '100%' },
         },
         h(StyleTag),
@@ -276,11 +330,23 @@ function createPlugin(React) {
   //   slots             —— ui-renderer 提供（客户端 UI 组合的底座）
   //   sidebarRight      —— @deepseek-ai/dsh-client-ui-sidebar-right/lib/client.js:9051
   //   sidebarRightTabs  —— 同包 lib/client.js:9050
-  // 服务名写错 = 插件静默不激活（不报错、什么都不显示），所以三者都来自实测证据。
+  //
+  // ⚠️ 不要凭猜往这里加名字。宿主在激活前会**等待**注入的服务出现，等不到就把这一行判为
+  // pending/failed，而失败会让整个 Web 前端拒绝加载（页面显示 "Failed to load plugins"）。
+  // 实测踩过：加了没核实的 'shortcuts' 之后，插件整包停止激活。
+  // 加任何新服务名之前，先在源码里找到 `provide("<name>")` 或 `super(ctx, "<name>")`。
   const inject = ['slots', 'sidebarRight', 'sidebarRightTabs']
 
+  /** 事件目标是否落在本插件的根节点内 —— 所有本插件快捷键的唯一准入判据。 */
+  function targetInsidePanel(target) {
+    if (!target || typeof target.closest !== 'function') return false
+    return target.closest('[' + ROOT_ATTR + ']') !== null
+  }
+
   function apply(ctx) {
-    const Panel = makePanel(ctx)
+    // 面板把「收起/展开」挂进来，供快捷键 handler 调用（见 makePanel 的注释）。
+    const toggleRef = { current: null }
+    const Panel = makePanel(ctx, toggleRef)
 
     // (a) 注册 tab 类型 —— 列的导航控制器靠它认领地址、给出标题。
     ctx.effect(
@@ -304,6 +370,53 @@ function createPlugin(React) {
         ),
       'freethought-map: panel body',
     )
+
+    // (c) 「首次出现时打开一次」本插件的 tab（卡 1 验收项 D1-1）。
+    //
+    // 为什么需要这一段：官方右列是**按会话挂载**的 —— 没有选中会话时，
+    // `ctx.sidebarRight.openTab()` 会直接 throw（README 原文：「命令需要一个已挂载的
+    // 会话停靠面；没有时它们 throw，而不是写进一个没人绘制的面里」）。
+    // 所以只能等：轮询 `sidebarRight.mounted`，一旦挂载面出现就开一次，然后落地标记，
+    // 之后用户关掉就不会再被弹回来。
+    //
+    // 用轮询而不是 hook，是因为这里拿不到 React 的绑定 hook（那是组件内部的东西），
+    // 而 `mounted` 是官方文档明确给出的「席位正在屏幕上的那个会话」可观察值。
+    const autopen = ctx.effect(() => {
+      let done = false
+      try {
+        done = window.localStorage.getItem(AUTOPEN_KEY) === '1'
+      } catch {
+        /* 读不到就当作没做过 */
+      }
+      if (done) return undefined
+
+      let tries = 0
+      const timer = window.setInterval(() => {
+        tries += 1
+        try {
+          // mounted 有值 = 会话停靠面已经在屏幕上，此时 openTab 才安全
+          const mounted = ctx.sidebarRight.mounted
+          if (mounted === undefined || mounted === null) {
+            if (tries > 120) window.clearInterval(timer) // 约 1 分钟还没会话就放弃
+            return
+          }
+          ctx.sidebarRight.openTab(TAB_KIND, { params: {} })
+          window.localStorage.setItem(AUTOPEN_KEY, '1')
+          window.clearInterval(timer)
+        } catch (e) {
+          // openTab 在竞态下仍可能抛（面刚拆掉）。记一条就放弃，绝不刷屏。
+          window.clearInterval(timer)
+          const logger = ctx.logger
+          if (logger && typeof logger.info === 'function') {
+            logger.info('[freethought-map] 自动打开 tab 失败（不影响手动打开）：' + String(e && e.message))
+          }
+        }
+      }, 500)
+
+      return () => window.clearInterval(timer)
+    }, 'freethought-map: auto-open tab')
+
+    void autopen
   }
 
   return { inject, apply }

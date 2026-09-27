@@ -1,0 +1,385 @@
+/**
+ * CDP 交互驱动 —— 被 verify-session.ps1 调用，不直接手跑。
+ *
+ * 目的：在没有人工点击的前提下，把页面推到「选中一个会话」的状态，
+ * 然后回答卡 1 最后那个问题：**官方右列挂载后，插件的 tab 与面板到底出不出来**。
+ *
+ * 只用**已存在的会话**（不新建、不发消息），所以不会产生任何 token 成本。
+ *
+ * 参数：
+ *   argv[2] = CDP webSocketDebuggerUrl
+ *   argv[3] = origin
+ *   argv[4] = token
+ *   argv[5] = ws 模块目录
+ *   argv[6] = 等待秒数（默认 25）
+ */
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
+
+const [, , wsUrl, origin, token, wsModuleDir, waitSecArg] = process.argv
+const WAIT_MS = Number(waitSecArg || 25) * 1000
+const PKG_NAME = 'dsh-freethought-map'
+const ROOT_SEL = '[data-freethought-map-root]'
+
+const require = createRequire(join(wsModuleDir, 'noop.js'))
+const WebSocket = require('ws')
+
+const results = []
+const ok = (m) => results.push(['PASS', m])
+const bad = (m) => results.push(['FAIL', m])
+const info = (m) => results.push(['INFO', m])
+
+const ws = new WebSocket(wsUrl, { perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 })
+let nextId = 1
+const pending = new Map()
+const pageErrors = []
+const consoleLogs = []
+
+function send(method, params = {}) {
+  const id = nextId++
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject })
+    ws.send(JSON.stringify({ id, method, params }))
+  })
+}
+
+ws.on('message', (raw) => {
+  let msg
+  try {
+    msg = JSON.parse(raw.toString())
+  } catch {
+    return
+  }
+  if (msg.id && pending.has(msg.id)) {
+    const { resolve, reject } = pending.get(msg.id)
+    pending.delete(msg.id)
+    if (msg.error) reject(new Error(msg.error.message))
+    else resolve(msg.result)
+    return
+  }
+  if (msg.method === 'Runtime.exceptionThrown') {
+    pageErrors.push(msg.params.exceptionDetails?.exception?.description ?? 'unknown')
+  }
+  // 激活失败的**真实错误**只会出现在控制台/日志里，页面 UI 不给细节 —— 必须抓下来
+  if (msg.method === 'Runtime.consoleAPICalled') {
+    const text = (msg.params.args ?? [])
+      .map((a) => a.value ?? a.description ?? a.unserializableValue ?? '')
+      .join(' ')
+    if (/activat|plugin|module|boot|failed|Error/i.test(text)) {
+      consoleLogs.push(`[${msg.params.type}] ${text}`)
+    }
+  }
+  if (msg.method === 'Log.entryAdded') {
+    const t = msg.params.entry.text ?? ''
+    if (/activat|plugin|module|boot|failed|Error/i.test(t)) {
+      consoleLogs.push(`[log:${msg.params.entry.level}] ${t}`)
+    }
+  }
+})
+
+await new Promise((resolve) => ws.on('open', resolve))
+await send('Runtime.enable')
+await send('Log.enable')
+await send('Page.enable')
+await send('Page.navigate', { url: `${origin}/?token=${encodeURIComponent(token)}` })
+await new Promise((r) => setTimeout(r, 6000))
+
+async function evaluate(expression) {
+  const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })
+  if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? 'eval failed')
+  return r.result?.value
+}
+
+// ── 1. 找出页面上的会话入口 ────────────────────────────────────────────────
+const survey = await evaluate(`(() => {
+  const pick = (sel) => {
+    const els = [...document.querySelectorAll(sel)];
+    return els.map(e => ({
+      tag: e.tagName,
+      text: (e.innerText || '').trim().slice(0, 60),
+      cls: (e.className || '').toString().slice(0, 80),
+      attrs: [...e.attributes].map(a => a.name).filter(n => n.startsWith('data-')).join(','),
+    })).slice(0, 12);
+  };
+  return {
+    buttons: pick('button'),
+    anchors: pick('a[href]'),
+    dataAttrs: [...new Set([...document.querySelectorAll('[data-conversation-session],[data-session-id],[data-workspace]')]
+      .map(e => e.tagName + ':' + [...e.attributes].map(a=>a.name).filter(n=>n.startsWith('data-')).join('+')))].slice(0, 20),
+    bodyStart: (document.body.innerText || '').trim().slice(0, 400),
+  };
+})()`)
+
+info(`页面按钮数 = ${survey?.buttons?.length ?? 0}`)
+info(`body 文本开头：${JSON.stringify((survey?.bodyStart ?? '').slice(0, 200))}`)
+if (survey?.dataAttrs?.length) info(`会话相关 data 属性：${survey.dataAttrs.join(' | ')}`)
+
+// ── 2. 优先找已有的会话行并点击；没有就点「新建会话」类按钮 ──────────────────
+const clickResult = await evaluate(`(() => {
+  const log = [];
+  // 优先：带会话标记的行
+  const sessionSel = '[data-conversation-session],[data-session-id],[data-session-row]';
+  let target = document.querySelector(sessionSel);
+  if (target) log.push('用会话标记元素：' + target.tagName + '.' + (target.className||'').toString().slice(0,40));
+
+  if (!target) {
+    // 其次：侧栏里可点的行（li / [role=button] / button），挑文本最像会话的
+    const rows = [...document.querySelectorAll('aside li, aside [role="button"], aside button, [class*="row"], [class*="item"]')]
+      .filter(e => (e.innerText || '').trim().length > 0 && e.offsetParent !== null);
+    log.push('侧栏候选行数：' + rows.length);
+    target = rows[0];
+    if (target) log.push('取第一行：' + (target.innerText||'').trim().slice(0,40));
+  }
+  if (!target) return { clicked: false, log };
+  target.scrollIntoView({ block: 'center' });
+  target.click();
+  return { clicked: true, log, text: (target.innerText || '').trim().slice(0, 60) };
+})()`)
+
+for (const l of clickResult?.log ?? []) info(`点击侦察：${l}`)
+
+// ── 3. 等右列挂载 + 面板出现 ────────────────────────────────────────────────
+const deadline = Date.now() + WAIT_MS
+let probe = null
+let sawRoot = false
+
+while (Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 1000))
+  try {
+    probe = await evaluate(`(() => {
+      const root = document.querySelector('${ROOT_SEL}');
+      const btns = [...document.querySelectorAll('button')].map(b => ({
+        t: (b.getAttribute('aria-label') || b.title || b.innerText || '').trim().slice(0, 40),
+        c: (b.className || '').toString().slice(0, 50),
+      })).filter(b => b.t);
+      return {
+        hasRoot: !!root,
+        rootCount: document.querySelectorAll('${ROOT_SEL}').length,
+        chatBubbles: document.querySelectorAll('[data-chat-node-key]').length,
+        rightPaneTabs: document.querySelectorAll('[class*="tab"]').length,
+        bodyHasMapTitle: (document.body.innerText || '').includes('FreeThought Map'),
+        bodyLen: (document.body.innerText || '').length,
+        buttons: btns.slice(0, 40),
+      };
+    })()`)
+  } catch (e) {
+    info(`轮询出错：${e.message}`)
+    continue
+  }
+  if (probe.hasRoot) {
+    sawRoot = true
+    break
+  }
+}
+
+if (!probe) {
+  bad('页面探测失败')
+} else {
+  info(`气泡数 = ${probe.chatBubbles}  右列 tab 候选元素 = ${probe.rightPaneTabs}`)
+  info(`页面文本长度 = ${probe.bodyLen}  含「FreeThought Map」= ${probe.bodyHasMapTitle}`)
+
+  if (probe.chatBubbles > 0) ok(`已选中会话（转录区有 ${probe.chatBubbles} 个气泡）`)
+  else info('仍未进入会话画面（转录区无气泡）')
+
+  if (sawRoot) {
+    ok(`插件根节点已渲染（${probe.rootCount} 个）—— 卡 1 / D1-1 通过`)
+  } else if (probe.bodyHasMapTitle) {
+    ok('页面文本里出现「FreeThought Map」—— tab 已注册但正文面板尚未展开')
+  } else {
+    bad('既没有插件根节点，页面文本里也没有「FreeThought Map」')
+    info(`可见按钮：${(probe.buttons ?? []).map((b) => b.t).join(' / ')}`)
+  }
+}
+
+// ── 4. 打开我们自己的 tab ────────────────────────────────────────────────────
+// 官方右列是**按会话挂载**的：必须等选出会话、停靠面真正 mount 之后，
+// `sidebarRight.openTab` 才有东西可开（没有挂载面时它会 throw，而不是静默失败）。
+if (!sawRoot) {
+  info('会话已选中，尝试用官方控制器打开 FreeThought Map tab…')
+  const openAttempts = 6
+  for (let i = 0; i < openAttempts && !sawRoot; i += 1) {
+    const r = await evaluate(`(() => {
+      // 走 UI：点会话 header 角落里的右列展开按钮（README 记载的席位）
+      const pick = (sel) => [...document.querySelectorAll(sel)].filter(e => e.offsetParent !== null);
+      const cands = pick('button,[role="button"]').filter(b => {
+        const s = ((b.getAttribute('aria-label') || '') + ' ' + (b.title || '')).toLowerCase();
+        return /右|right|sidebar|panel|侧栏/.test(s);
+      });
+      if (cands.length) { cands[0].click(); return { how: 'header-corner-button', n: cands.length, label: (cands[0].getAttribute('aria-label') || cands[0].title || '').slice(0, 40) }; }
+      return { how: 'none', n: 0 };
+    })()`)
+    if (i === 0) info(`展开尝试：${JSON.stringify(r)}`)
+    await new Promise((res) => setTimeout(res, 1500))
+    const snap = await evaluate(`(() => {
+      const root = document.querySelector('${ROOT_SEL}');
+      const body = document.body.innerText || '';
+      // 右列 tab 条：dockkit 的稳定 data 属性
+      const tabs = [...document.querySelectorAll('[data-dockkit-tab]')].map(t => ({
+        id: t.getAttribute('data-dockkit-tab'),
+        text: (t.innerText || '').trim().slice(0, 40),
+      }));
+      const panes = [...document.querySelectorAll('[data-dockkit-pane]')].length;
+      const hosts = [...document.querySelectorAll('[data-dockkit-host]')].map(h => h.getAttribute('data-dockkit-host'));
+      return {
+        root: !!root,
+        tabCount: tabs.length,
+        tabs,
+        panes,
+        hosts,
+        hasMapText: body.includes('FreeThought Map'),
+        rightPaneText: (document.querySelector('[data-dockkit-surface]')?.innerText || '').slice(0, 300),
+      };
+    })()`)
+    if (i === 0) {
+      info(`展开后快照：dockkit tabs=${snap.tabCount} panes=${snap.panes} hosts=${JSON.stringify(snap.hosts)} root=${snap.root}`)
+      if (snap.tabs.length) info(`  可见 tab：${snap.tabs.map((t) => t.text || t.id).join(' | ')}`)
+      if (snap.rightPaneText) info(`  右列文本：${JSON.stringify(snap.rightPaneText.slice(0, 200))}`)
+    }
+    if (snap.root) {
+      sawRoot = true
+      break
+    }
+  }
+}
+
+if (sawRoot) {
+  ok(`插件根节点已渲染 —— 卡 1 / D1-1 通过`)
+  const detail = await evaluate(`(() => {
+    const el = document.querySelector('${ROOT_SEL}');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return {
+      w: Math.round(r.width), h: Math.round(r.height),
+      collapsed: el.getAttribute('data-collapsed'),
+      hasResizer: !!el.querySelector('.ftm-resizer'),
+      hasBar: !!el.querySelector('.ftm-bar'),
+      hasBody: !!el.querySelector('.ftm-body'),
+      text: (el.innerText || '').slice(0, 260),
+      bg: getComputedStyle(el).backgroundColor,
+      color: getComputedStyle(el).color,
+    };
+  })()`)
+  if (detail) {
+    info(`面板几何：${detail.w}×${detail.h}  collapsed=${detail.collapsed}`)
+    ok(`结构齐全：标题栏=${detail.hasBar} 正文=${detail.hasBody} 拖宽热区=${detail.hasResizer}`)
+    info(`面板文本：${JSON.stringify(detail.text)}`)
+    info(`继承到的主题色：color=${detail.color} bg=${detail.bg}`)
+    if (/0\.1\.7-rc\.2/.test(detail.text) && /c1275515/.test(detail.text)) {
+      ok('面板里显示了宿主版本串与 commit（探针取证可用）')
+    } else {
+      info('面板文本里没有版本串（可能正文被收起）')
+    }
+
+    // ── D1-4 键盘隔离：往面板里发合成按键，验证只有面板响应；
+    //    再往面板外发一次，验证宿主那边不受影响（面板状态不变）。
+    const kb = await evaluate(`(async () => {
+      const root = document.querySelector('${ROOT_SEL}');
+      if (!root) return { ok: false, why: 'no root' };
+      const before = root.getAttribute('data-collapsed');
+      const fire = (target) => target.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'm', code: 'KeyM', ctrlKey: true, altKey: true, bubbles: true, cancelable: true,
+      }));
+      // 1) 在面板内按 Ctrl+Alt+M → 应该收起
+      fire(root.querySelector('.ftm-bar') || root);
+      await new Promise(r => setTimeout(r, 300));
+      const afterInside = root.getAttribute('data-collapsed');
+      // 2) 在面板外（document.body）按同一个键 → 面板状态不应改变
+      fire(document.body);
+      await new Promise(r => setTimeout(r, 300));
+      const afterOutside = root.getAttribute('data-collapsed');
+      // 3) 面板内再按一次 → 应该展开回来
+      fire(root.querySelector('.ftm-bar') || root);
+      await new Promise(r => setTimeout(r, 300));
+      const afterAgain = root.getAttribute('data-collapsed');
+      return { ok: true, before, afterInside, afterOutside, afterAgain };
+    })()`)
+    if (kb && kb.ok) {
+      info(`键盘隔离实测：内=${kb.before}→${kb.afterInside}  外→${kb.afterOutside}  内再按→${kb.afterAgain}`)
+      if (kb.before === kb.afterInside) bad('面板内按 Ctrl+Alt+M 没有收起（快捷键没生效）')
+      else ok('面板内按 Ctrl+Alt+M 能收起（面板自己的快捷键生效）')
+      if (kb.afterInside !== kb.afterOutside) bad('面板外按同一个键也改了面板状态 —— 说明监听泄漏到宿主')
+      else ok('面板外按同一个键不影响面板（键盘隔离成立）')
+      if (kb.afterAgain !== kb.before) bad('面板内再按一次没有恢复（往复切换坏了）')
+      else ok('面板内再按一次能展开回来（往复切换正常）')
+    } else {
+      info(`键盘隔离未测到：${JSON.stringify(kb)}`)
+    }
+  }
+}
+
+if (pageErrors.length) {
+  for (const e of pageErrors.slice(0, 3)) bad(`未捕获异常：${String(e).slice(0, 260)}`)
+} else {
+  ok('无未捕获异常')
+}
+
+// 激活失败的细节只在控制台里 —— 全部打出来，便于定位
+// ── 5. D1-2：整列让位 —— 用**官方右列自己的折叠按钮**收起右列，官方对话列应变宽 ──────
+//
+// 注意分清两个「收起」：
+//   · 插件面板标题栏上的「收起」= 只收起正文，保留标题栏（留一条回到展开态的路），不释放列宽；
+//   · 官方右列的折叠按钮 = 整列让位，此时对话列才变宽。
+// D1-2 验收的是后者（「收对话图变宽」）。
+{
+  const convBox = () =>
+    evaluate(`(() => {
+      const el = document.querySelector('[data-conversation-session],[data-conversation-region]');
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { w: Math.round(r.width), right: Math.round(r.right) };
+    })()`)
+
+  /** 点「打开右侧边栏」那个官方按钮（折叠/展开右列） */
+  const toggleOfficialRightbar = () =>
+    evaluate(`(async () => {
+      const btns = [...document.querySelectorAll('button,[role="button"]')].filter(b => {
+        const s = ((b.getAttribute('aria-label') || '') + ' ' + (b.title || '')).trim();
+        return /打开右侧边栏|收起右侧边栏|关闭右侧边栏|right sidebar|toggle right panel/i.test(s);
+      });
+      if (!btns.length) return { ok: false, n: 0 };
+      btns[0].click();
+      await new Promise(r => setTimeout(r, 1200));
+      return { ok: true, label: (btns[0].getAttribute('aria-label') || btns[0].title || '').slice(0, 30) };
+    })()`)
+
+  const before = await convBox()
+  const collapse = await toggleOfficialRightbar()
+  const after = await convBox()
+
+  const fmt = (x) => (x ? `${x.w}px(right=${x.right})` : 'n/a')
+  info(`官方右列折叠：${JSON.stringify(collapse)}`)
+  info(`D1-2 整列让位实测 —— 右列开时对话列 ${fmt(before)} / 右列收起后 ${fmt(after)}`)
+
+  if (collapse.ok && before && after && after.w > before.w) {
+    ok(`收起官方右列后对话列变宽 ${before.w}→${after.w}px（D1-2「收对话图变宽」通过）`)
+  } else if (!collapse.ok) {
+    info('没找到官方右列的折叠按钮，D1-2 未测到')
+  } else {
+    bad(`收起右列后对话列没有变宽（${fmt(before)}→${fmt(after)}）`)
+  }
+
+  // 恢复右列，并确认插件面板还在（= 让位之后还能回来）
+  if (collapse.ok) {
+    await toggleOfficialRightbar()
+    await new Promise((r) => setTimeout(r, 1200))
+    const restored = await convBox()
+    const rootBack = await evaluate(`!!document.querySelector('${ROOT_SEL}')`)
+    info(`恢复右列后 —— 对话列 ${fmt(restored)}，插件面板在=${rootBack}`)
+    if (rootBack) ok('展开右列后插件面板仍在（让位可逆）')
+    else info('恢复右列后插件面板不在了（可能被收起为折叠态）')
+  }
+}
+
+if (consoleLogs.length) {
+  info(`控制台相关消息 ${consoleLogs.length} 条：`)
+  for (const l of consoleLogs.slice(0, 20)) info('  ' + l.slice(0, 400))
+}
+
+const fails = results.filter(([s]) => s === 'FAIL')
+const pad = Math.max(...results.map(([, m]) => m.length))
+console.log('')
+for (const [s, m] of results) console.log(`  ${s.padEnd(4)}  ${m}`)
+console.log('')
+console.log(`会话内渲染验证：${results.filter(([s]) => s === 'PASS').length} 通过 / ${fails.length} 失败`)
+ws.close()
+process.exit(fails.length ? 1 : 0)

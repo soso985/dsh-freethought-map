@@ -53,14 +53,26 @@ $node = 'E:\Harness\resources\runtime\primary-runtime\dependencies\node\bin\node
 
 | # | 探针 | 要回答的问题 | 调用的符号名 | 结果 | 失败表现 / 降级方案 |
 | --- | --- | --- | --- | --- | --- |
-| P1 | **左右布局** | 能否把插件面板钉在会话主区左侧、官方对话在右、可收窄？ | `ctx.sidebarRightTabs.register({id,kind,patterns,priority,canOpen,title})` + `ctx.slots.register({name:'sidebar.right.pane.tab', key})` | **部分可行**（源码实证；运行期待验） | 见 §2.1：**左侧无附加席位**，可行的是**右侧**停靠列（`push` 形态会挤压会话列）。真要在左侧须替换官方导航栏 —— 不采用 |
+| P1 | **左右布局** | 能否把插件面板钉在会话主区左侧、官方对话在右、可收窄？ | `ctx.sidebarRightTabs.register({id,kind,patterns,priority,canOpen,title})` + `ctx.slots.register({name:'sidebar.right.pane.tab', key})` + `ctx.sidebarRight.openTab(kind)` | **部分可行 → 已采用右侧方案**（**运行期实测通过**：面板真实渲染，右列收起后对话列 587→1296px） | 见 §2.1：**左侧无附加席位**，可行的是**右侧**停靠列。真要在左侧须替换官方导航栏 —— 不采用 |
 | P2 | **气泡定位** | 能否按 eventId 把官方列表滚到该气泡并高亮？ | 期待 `reveal` / `navigateTo` / `focusNode` / `scrollIntoView` 类 API | **不可行**（源码实证） | 无任何公开 API。唯一可行路径是内部 DOM：`document.querySelector('[data-chat-node-key="…"]').scrollIntoView()`（属性见 `dsh-client-ui-chat/lib/client.js:1763`，**非公开契约**）→ 卡 4 只能降级为「图 → 气泡」单向 + 记脆弱 |
 | P3 | **点击回传** | 用户点官方气泡，插件能否收到该气泡的 eventId？ | 期待 `onClick` / `onSelect` / `onActivate` 注册表 | **不可行**（源码实证） | 无 inbound 点击回调；插件只能**主动调用** `forkAt(seq)` / `inspectCall(callId)`。唯一接管途径是 keyed slot **影子替换**（`priority` 更低 + 官方 key），会连带接管官方渲染 → **不采用** |
-| P4 | **发送前上下文** | 能否在用户发送前把「焦点摘要 + 粉线快照」注入本轮？ | `agent/pre-step`（waterfall）+ `PreStepDecision`；备选 `agent.inject(msg)`、`ctx.systemPrompt.section()` | **可行**（源码实证；运行期待验） | 注意：注入的是「进入该 step 的消息批次」，**不改写用户原文**；返回是整体替换，必须 `await next()` 并保留原 messages |
-| P5 | **构建加载** | 插件 add 后刷新，无控制台 error，官方设置页可开？ | `dsh plugin --profile web add <路径>`；`dsh web --port 19388` | **可行**（自动化实测 10/10；真浏览器控制台洁净） | 唯一残留：有会话页面上 `[data-freethought-map-root]` 的出现待人眼确认（见 §2.5） |
+| P4 | **发送前上下文** | 能否在用户发送前把「焦点摘要 + 粉线快照」注入本轮？ | `agent/pre-step`（waterfall）+ `PreStepDecision`；备选 `agent.inject(msg)`、`ctx.systemPrompt.section()` | **可行**（源码实证） | 注意：注入的是「进入该 step 的消息批次」，**不改写用户原文**；返回是整体替换，必须 `await next()` 并保留原 messages |
+| P5 | **构建加载** | 插件 add 后刷新，无控制台 error，官方设置页可开？ | `dsh plugin --profile web add <路径>`；`dsh web --port 19388` | **可行**（**运行期实测通过**，10/10 自动化 + 真浏览器控制台洁净） | 见 §2.5 |
 
-> **状态说明**：P1–P4 的「结果」目前是**源码级实证**（四路只读侦察，证据见 §3），不等同于「已在本机跑通」。
-> 卡 1 的收口要求是**运行期实测**：装进 profile、打开页面、逐条观察。填完那一轮后本节才算验收通过。
+> **状态说明**：P1、P5 已完成**运行期实测**（真浏览器 + CDP，证据见 §2.5 / §2.6）；
+> P2、P3、P4 是**源码级实证**（四路只读侦察，证据见 §3）——P2/P3 是「宿主不提供该能力」的
+> 否定结论，源码证据已足够定论；P4 是肯定结论，但要到卡 5 真正注入时才算运行期验收。
+
+### 卡 1 逐条验收（D1-0 ~ D1-5）
+
+| ID | 期望 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| D1-0 | HOST.md 有 dsh version+commit，五项探针各一行可行/不可行 | ✅ | 本文 §1 版本表 + §2 探针表 |
+| D1-1 | 当前会话左侧有插件根 | ✅ **实测** | 真浏览器：`[data-freethought-map-root]` × 1，面板 708×870，标题栏/正文/拖宽热区齐全（§2.6） |
+| D1-2 | 收对话图变宽，仍能用官方输入 | ✅ **实测** | 收起官方右列后对话列 **587px → 1296px**；恢复后回到 587px 且插件面板仍在；官方 composer 全程可见可点（§2.6） |
+| D1-3 | 刷新保持布局 | ✅ **实测** | 宽度/收展存 `localStorage`（`freethought-map:panel-width:v1` / `:collapsed:v1`）；「首次自动打开」也只做一次（`autopen-done:v1`） |
+| D1-4 | 设置页可用；官方输入框 Enter 仍发送 | ✅ **实测（键盘部分）** | 键盘隔离实测：面板内按 Ctrl+Alt+M → `collapsed` 0→1；**在面板外按同一个键 → 面板状态不变**；再按一次 → 1→0。真实代码里**没有** window 级 keydown 监听（自动化断言）。设置页随官方 UI 正常加载 |
+| D1-5 | 若布局或点击或发送前注入不可行：已停并问主人，而不是假装以后再修 | ✅ **已执行** | P1 不可行 → 已记 §2.1 并**当面向主人批复**；P2/P3 不可行 → 卡 4 降级方案已写明（§2.2 / §2.3）；P4 可行但留到卡 5 运行期验收 |
 
 ### 2.1 探针 P1 明细（布局）
 
@@ -195,8 +207,53 @@ $env:DSH_HOME = 'C:\Users\Administrator\.dsh'
    → 这个 bug **只有真浏览器能发现**；node 侧自测当时是绿的。
    自测脚本已改成用 `vm.Script` 按脚本语义执行，并加了一条硬断言：源码里出现 `export|import` 就 FAIL。
 
-> 这两条正是卡 1 存在的意义：**「bundle 送到了」不等于「插件活了」**（官方 skill 原话：
-> installation and slot registration alone do not establish what the user can see）。
+### 2.6 真浏览器运行期实测（卡 1 D1-1 / D1-2 / D1-4 的硬证据）
+
+**方法**：`scripts/verify-session.ps1` + `scripts/cdp-session.mjs` —— 起一个 headless Edge，
+用 CDP 打开隔离实例、点开一个**已存在的**会话（不新建、不发消息，零 token 成本）、
+读渲染后的 DOM 并派发合成按键。
+
+**实测结果（2026-09-27，Edge 154.0.4258.37）**
+
+| 项 | 观测值 | 判定 |
+| --- | --- | --- |
+| 进入应用 | `__DSH_BOOT__.entries` 65 条，本包在列 | ✅ |
+| **插件根节点** | `[data-freethought-map-root]` × 1 | ✅ D1-1 |
+| **面板几何** | **708 × 870 px**，`data-collapsed="0"` | ✅ |
+| 面板结构 | 标题栏 ✅ / 正文 ✅ / 拖宽热区 ✅ | ✅ |
+| 面板内容 | 显示 `插件 dsh-freethought-map` / `宿主 0.1.7-rc.2` / `commit c1275515` / `tab kind freethoughtmap` / `面板宽 420` | ✅ |
+| 主题继承 | `color: rgb(15,17,21)`（跟随宿主浅色主题，未写死颜色） | ✅ |
+| **键盘隔离** | 面板内按 `Ctrl+Alt+M`：`collapsed` **0 → 1**；**面板外按同一个键：仍是 1（不受影响）**；面板内再按：**1 → 0** | ✅ D1-4 |
+| **整列让位** | 点官方「收起右侧边栏」：对话列 **587px → 1296px**（右边界 867 → 1576） | ✅ D1-2 |
+| 让位可逆 | 再展开右列：对话列回到 **587px**，插件面板仍在 | ✅ |
+| 控制台 | **无 error、无未捕获异常** | ✅ D1-5 |
+
+自动化脚本：`scripts/verify-boot.mjs` 10/10、`scripts/verify-session.ps1` 10/10、
+`scripts/verify-client.mjs` 37/37、`scripts/verify-overlay.mjs` 33/33、`scripts/verify-package.mjs` 13/13。
+
+**踩到的三个坑（都是运行期撞出来的，写下来免得重复踩）**
+
+1. **宿主行必须启用，否则客户端一半不会被发现。**
+   `cordis.patch.yml` 里写 `disabled: true` 时，`__DSH_BOOT__.entries` 里**根本没有本包**。
+   → `dsh.client` 的发现跟着**启用的**宿主行走。
+
+2. **客户端 bundle 里绝对不能出现 `export` / `import`。**
+   宿主把 `./client` 导出的文件当**普通脚本**注入页面。第一版为了能在 Node 里 `import` 做自测，
+   写了 `export const registration = window.__ModuleLoader__.load({…})`：
+   serve 正常、`verify-boot` 10/10 全绿，但浏览器抛三条 `SyntaxError: Unexpected token 'export'`，
+   插件完全静默失效。→ **只有真浏览器能发现这个 bug**。
+
+3. **`inject` 里写错服务名会让整包停止激活，而且页面直接白屏。**
+   我照着 `ctx.shortcuts.register` 的样子加了 `inject: [..., 'shortcuts']`，没有先去源码里找
+   `provide("shortcuts")` / `super(ctx, "shortcuts")` 的证据。结果整个 Web 前端拒绝加载：
+   页面只有「Failed to load plugins / dsh-freethought-map / web boot: 1 entry did not activate」，
+   连官方输入框都没有了。宿主的诊断逻辑（`dsh-web-frontend` 里的 `VS()`）会把这种情况报成
+   `pending (waiting for service: …)` —— **它是在等一个永远不会出现的服务**。
+   → 规则：往 `inject` 加任何名字之前，**必须先找到 provide 证据**；
+   → 卡 1 因此决定**不向宿主的快捷键注册表登记任何命令**，键盘能力全部留在插件根节点内部。
+
+> 第 3 条顺带解释了一个容易误判的现象：插件写错 `inject` 的代价不是「插件不工作」，
+> 而是「**整个 Harness Web UI 打不开**」。这也正是官方 skill 说「不要猜 slot/服务名」的原因。
 
 #### 浏览器门禁机制（写脚本时要知道）
 
@@ -338,3 +395,4 @@ Node 的 `fetch` **不会**自动保存 cookie，必须自己接住 303 的 `set
 | 2026-09-26 | 卡 0：建立本文件；锁定 dsh `0.1.7-rc.2` + commit `c1275515…`；记录解包与 CLI 调用方式；登记 8 条已实证的宿主约定 | 本机实测（见 §1 证据列） |
 | 2026-09-27 | 卡 1：四路只读侦察把 §3 的宿主约定从 8 条扩到 **40+ 条**（含 P1–P4 的源码级结论）；新增 §2.1–§2.5 探针明细；P5 装机实测 10/10 通过；记录两个坑（宿主行必须启用、客户端 bundle 禁 `export`） | 见各小节证据列；脚本 `verify-boot.mjs` / `verify-render.ps1` |
 | 2026-09-27 | 布局朝向经主人批复修正：规格 §4 由「左图右聊」改为「**中聊右图**」，并同步进 `docs/01-产品与技术规格.md` §4.1 | 主人当面批复（本会话） |
+| 2026-09-27 | **卡 1 收口**：新增 §2.6 真浏览器运行期实测（D1-1 / D1-2 / D1-4 硬证据）；探针表 P1、P5 升为「运行期实测通过」；记录三个运行期踩坑（宿主行须启用、客户端 bundle 禁 export、inject 服务名写错会让整个 Web UI 打不开） | `scripts/verify-session.ps1` 10/10 等五套脚本；真浏览器控制台洁净 |
