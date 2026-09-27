@@ -70,11 +70,15 @@ if (pkg) {
   if (existsSync(clientFile)) {
     const text = readFileSync(clientFile, 'utf8')
     // 模块 id 可以写成字面量，也可以写成常量；两种写法都认，但值必须等于包名。
-    const call = text.match(/__ModuleLoader__\s*\.\s*load\s*\(\s*\{([\s\S]*?)\}\s*\)/)
+    //
+    // 注意：`load(` 之后的花括号里可能夹着注释块，所以**不能**要求 `id` 与 `{` 邻接。
+    // 只取 load({ 之后的第一处 id —— 那才是模块 id；文件里后面还有 slot 注册的 id
+    // （如 'freethought-map-panel'），用贪婪匹配会误抓。
+    const call = text.match(/__ModuleLoader__\s*\.\s*load\s*\(\s*\{([\s\S]*)/)
     if (!call) {
       bad('客户端文件里找不到 window.__ModuleLoader__.load({ ... })')
     } else {
-      const head = call[1]
+      const head = call[1].slice(0, 1200)
       const lit = head.match(/\bid\s*:\s*['"]([^'"]+)['"]/)
       const ref = head.match(/\bid\s*:\s*([A-Za-z_$][\w$]*)/)
       let value = lit?.[1]
@@ -91,10 +95,16 @@ if (pkg) {
   }
 }
 
-// 2. ESM 语法解析
-const targets = ['src/host/index.js', 'src/client/index.js']
+// 2. 语法解析
+//    ⚠️ 两个入口的**语义不同**，不能用同一把尺子：
+//      - src/host/index.js  ← 真 ESM，按模块解析
+//      - src/client/index.js ← **普通脚本**（宿主用 <script src> 注入页面），
+//        出现 export/import 反而会让浏览器抛 SyntaxError，所以必须按脚本解析。
+const esmTargets = ['src/host/index.js']
+const scriptTargets = ['src/client/index.js']
 const ctx = vm.createContext({ console })
-for (const rel of targets) {
+
+for (const rel of esmTargets) {
   const abs = join(root, rel)
   if (!existsSync(abs)) {
     bad(`${rel} 不存在`)
@@ -105,9 +115,29 @@ for (const rel of targets) {
       identifier: pathToFileURL(abs).href,
       context: ctx,
     })
-    ok(`${rel} ESM 语法解析通过`)
+    ok(`${rel} ESM 模块语法解析通过`)
   } catch (e) {
     bad(`${rel} 解析失败：${e.message}`)
+  }
+}
+
+for (const rel of scriptTargets) {
+  const abs = join(root, rel)
+  if (!existsSync(abs)) {
+    bad(`${rel} 不存在`)
+    continue
+  }
+  const text = readFileSync(abs, 'utf8')
+  try {
+    new vm.Script(text, { filename: abs })
+    ok(`${rel} 普通脚本语法解析通过`)
+  } catch (e) {
+    bad(`${rel} 解析失败：${e.message}`)
+  }
+  if (/^\s*(export|import)\s/m.test(text)) {
+    bad(`${rel} 出现 export/import —— 它会被当普通脚本注入，浏览器会抛 SyntaxError`)
+  } else if (rel.includes('client')) {
+    ok(`${rel} 没有 export/import（符合普通脚本约定）`)
   }
 }
 
