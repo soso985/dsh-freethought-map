@@ -117,8 +117,26 @@ info(`body 文本开头：${JSON.stringify((survey?.bodyStart ?? '').slice(0, 20
 if (survey?.dataAttrs?.length) info(`会话相关 data 属性：${survey.dataAttrs.join(' | ')}`)
 
 // ── 2. 优先找已有的会话行并点击；没有就点「新建会话」类按钮 ──────────────────
+//
+// `FTM_SESSION_ID` 可指定要打开的会话（诊断用）。不指定时沿用旧的启发式：
+// 会话标记元素 → 侧栏第一行。
+// ⚠️ 指定时**必须**用 `[data-row-key^="session:"]` —— 那是会话行的稳定标记
+// （真机侦察得到），泛化的 li/row 选择器会点到 composer。
+const WANT_SESSION = process.env.FTM_SESSION_ID || ''
 const clickResult = await evaluate(`(() => {
   const log = [];
+  const want = ${JSON.stringify(WANT_SESSION)};
+  if (want) {
+    const rows = [...document.querySelectorAll('[data-row-key^="session:"]')].filter(e => e.offsetParent !== null);
+    const hit = rows.find(e => (e.getAttribute('data-row-key') || '').includes(want));
+    log.push('指定会话：候选 ' + rows.length + ' 行，' + (hit ? '命中' : '**未命中**'));
+    if (!hit) {
+      return { clicked: false, log, have: rows.map(e => (e.getAttribute('data-row-key') || '').slice(0, 50)) };
+    }
+    hit.scrollIntoView({ block: 'center' });
+    hit.click();
+    return { clicked: true, log, picked: hit.getAttribute('data-row-key') };
+  }
   // 优先：带会话标记的行
   const sessionSel = '[data-conversation-session],[data-session-id],[data-session-row]';
   let target = document.querySelector(sessionSel);
@@ -139,6 +157,9 @@ const clickResult = await evaluate(`(() => {
 })()`)
 
 for (const l of clickResult?.log ?? []) info(`点击侦察：${l}`)
+if (clickResult && clickResult.clicked === false && clickResult.have) {
+  info('可用会话行：' + clickResult.have.join(' | '))
+}
 
 // ── 3. 等右列挂载 + 面板出现 ────────────────────────────────────────────────
 const deadline = Date.now() + WAIT_MS
@@ -585,5 +606,89 @@ console.log('')
 for (const [s, m] of results) console.log(`  ${s.padEnd(4)}  ${m}`)
 console.log('')
 console.log(`会话内渲染验证：${results.filter(([s]) => s === 'PASS').length} 通过 / ${fails.length} 失败`)
+
+// ── 诊断出口：面板链行显示了什么标题（FTM_PANEL_DIAG=1 时打印）──────────────
+//
+// 复用这里已经跑通的「进会话 + 打开插件 tab」逻辑，避免另写一套点击逻辑
+// （先前单独写的诊断脚本点不进会话画面，面板根本没挂载）。
+if (process.env.FTM_PANEL_DIAG === '1') {
+  // 先确保面板真的打开：右列 tab 条里找我们的 tab 并点它。
+  // （宿主只在「第一次」自动打开；测试用的临时 profile 每次都相当于第一次，
+  //  但会话切换/右列收起之后不一定还开着 —— 不点开就看不到链行。）
+  const rootNow = await evaluate(`!!document.querySelector('[data-freethought-map-root]')`)
+  if (!rootNow) {
+    console.log('\n=== 诊断：先打开插件 tab ===')
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const opened = await evaluate(`(() => {
+        const vis = (e) => e.offsetParent !== null;
+        // 1) dockkit tab 条里按文本找
+        const tabs = [...document.querySelectorAll('[data-dockkit-tab], [role="tab"], button')].filter(vis);
+        const mine = tabs.find(t => /FreeThought|思路|ftm/i.test((t.innerText || '') + ' ' + (t.getAttribute('aria-label') || '') + ' ' + (t.title || '')));
+        if (mine) { mine.click(); return { via: 'tab-text', label: (mine.innerText || mine.getAttribute('aria-label') || '').trim().slice(0, 30) }; }
+        return { via: 'none', candidates: tabs.map(t => (t.innerText || t.getAttribute('aria-label') || '').trim().slice(0, 18)).filter(Boolean).slice(0, 14) };
+      })()`)
+      if (attempt === 0) console.log('  ' + JSON.stringify(opened))
+      await new Promise((res) => setTimeout(res, 1800))
+      const got = await evaluate(`!!document.querySelector('[data-freethought-map-root]')`)
+      if (got) {
+        console.log('  面板已打开（第 ' + (attempt + 1) + ' 次尝试）')
+        break
+      }
+    }
+  } else {
+    console.log('\n=== 诊断：面板本来就开着 ===')
+  }
+
+  console.log('\n=== 诊断：面板链行 ===')
+  const rows = await evaluate(`(() => {
+    const root = document.querySelector('[data-freethought-map-root]');
+    if (!root) return { hasRoot: false };
+    const items = [...root.querySelectorAll('[data-ftm-node]')].map(li => ({
+      node: li.getAttribute('data-ftm-node'),
+      kind: li.getAttribute('data-ftm-kind'),
+      title: (li.querySelector('.ftm-chain-title') || {}).textContent || '',
+      indent: li.style.paddingLeft || '',
+    }));
+    return { hasRoot: true, chainCount: root.getAttribute('data-ftm-chain'), items };
+  })()`)
+  console.log('  hasRoot=' + rows.hasRoot + '  chainCount=' + rows.chainCount)
+  if (rows.items) {
+    for (const it of rows.items) {
+      console.log('    ' + String(it.node).padEnd(24) + ' ' + String(it.kind).padEnd(6) + ' indent=' + String(it.indent).padEnd(6) + ' title=' + JSON.stringify(it.title))
+    }
+    const real = rows.items.filter((r) => r.title && r.title !== '（无标题）' && r.title !== '（已清空）')
+    console.log('  显示真实标题的行数: ' + real.length + ' / ' + rows.items.length)
+  }
+
+  console.log('\n=== 诊断：数据源（直接打宿主两个端点）===')
+  const probe = await evaluate(`(async () => {
+    const root = document.querySelector('[data-freethought-map-root]');
+    const m = root ? (root.innerText || '').match(/session-[0-9a-f-]{8,}/i) : null;
+    if (!m) return { err: 'no-session-id-in-panel' };
+    const sid = m[0];
+    const post = async (method, args) => {
+      const rpcId = 'diag-' + Math.random().toString(36).slice(2);
+      const r = await fetch('/api/freethoughtMap/' + method, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId, method: 'freethoughtMap/' + method, payload: { args } })
+      });
+      return await r.json();
+    };
+    const ev = await post('events', { sessionId: sid, sinceSeq: -1 });
+    const ld = await post('load', { sessionId: sid });
+    const entries = (ev.result && ev.result.ok && ev.result.value && ev.result.value.entries) || [];
+    const doc = (ld.result && ld.result.ok && ld.result.value && ld.result.value.doc) || null;
+    return {
+      sessionId: sid,
+      eventsCount: entries.length,
+      eventsWithTitle: entries.filter(e => e.title).length,
+      eventsSample: entries.map(e => ({ eventId: String(e.eventId).slice(0, 12), title: e.title })),
+      docNodes: doc ? Object.keys(doc.nodes).length : null,
+      refsInLog: doc ? Object.values(doc.nodes).filter(n => n.sourceRef && entries.some(e => e.eventId === n.sourceRef.eventId)).length : null,
+    };
+  })()`)
+  console.log('  ' + JSON.stringify(probe, null, 2).split('\n').join('\n  '))
+}
+
 ws.close()
 process.exit(fails.length ? 1 : 0)

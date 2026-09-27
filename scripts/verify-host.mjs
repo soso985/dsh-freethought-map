@@ -603,6 +603,19 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
     } else {
       bad('探针记录构造不是独立函数 —— 无法离线断言')
     }
+    // 问题 B 相关：探针必须记录「这一步进来之前已有的注入条数」
+    // —— 只看 outcome=injected 分不清"每步都注入是必要还是重复"
+    if (/payloadInjected/.test(probeSource) && /decisionInjected/.test(probeSource)) {
+      ok('探针记录 payloadInjected / decisionInjected（用于判定"每步都注入"是否重复）')
+    } else {
+      bad('探针没有记录已有注入条数 —— 无法回答"同一步重复注入"这个问题')
+    }
+    if (/export function isInjectedMessage\(/.test(probeSource)) {
+      ok('注入消息的识别走 source.kind/form（不按文本前缀 —— 那会被用户原文污染）')
+    } else {
+      bad('注入消息识别没有结构化判据')
+    }
+
     // 不该把注入正文全文写进日志（隐私 + 体积）
     if (/textPreview/.test(probeSource) && !/text:\s*inj\.text\b/.test(probeSource)) {
       ok('探针只写注入文本的**预览**，不写全文')

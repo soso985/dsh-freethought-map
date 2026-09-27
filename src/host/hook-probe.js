@@ -23,6 +23,29 @@ import { join } from 'node:path'
 /** 探针日志的固定位置（刻意放临时目录：它是诊断产物，不该进仓库或用户数据目录）。 */
 export const PROBE_FILE = join(tmpdir(), 'ftm-pre-step-probe.jsonl')
 
+/** 我们注入的消息有哪些特征（用于识别「这一步里是不是已经有我们注入的那条」）。 */
+export const INJECTION_SOURCE_KIND = 'freethought-map'
+export const INJECTION_SOURCE_FORM = 'graph-context'
+
+/**
+ * 这条消息是不是我们自己注入的「用户图数据」。
+ *
+ * 判定按 `source.kind`/`source.form`，**不按文本前缀** —— 文本前缀会被用户原文里的
+ * 巧合字符串污染，而 source 是我们自己写进去的结构化标记。
+ */
+export function isInjectedMessage(message) {
+  const s = message && message.source
+  return Boolean(s && s.kind === INJECTION_SOURCE_KIND && s.form === INJECTION_SOURCE_FORM)
+}
+
+/** 一批消息里有几条是我们的注入。 */
+export function countInjected(messages) {
+  if (!Array.isArray(messages)) return 0
+  let n = 0
+  for (const m of messages) if (isInjectedMessage(m)) n += 1
+  return n
+}
+
 /**
  * 从 pre-step 的 payload + 我们最终给出的 decision，算出这条日志记录。
  *
@@ -55,6 +78,18 @@ export function buildProbeEntry(input) {
   const finalIds = idsOf(finalEnter)
   const changed = JSON.stringify(origIds) !== JSON.stringify(finalIds)
 
+  // ── 「这一步之前是否**已经**带着我们的注入」──────────────────────────────
+  //
+  // 为什么需要这一格（问题 B：同一 turn 的每个 step 都会注入，是重复还是必要？）：
+  // 只看 `outcome=injected` 分不清两种情况：
+  //   (a) 每个 step 都是全新的消息批次 → 每步注入是**必要**的（否则该步没有图上下文）
+  //   (b) 上下文会累积 → 每步注入就是**重复**的（白花 token、还会让模型看到多份）
+  // 这一格直接回答：**payload / 下游决策里已经存在的注入条数**。
+  //   · `payloadInjected === 0` 且 `decisionInjected === 0` → 情况 (a)
+  //   · 大于 0 → 情况 (b)，那就不该再注入
+  const payloadInjected = countInjected(origMsgs)
+  const decisionInjected = countInjected(origEnter)
+
   const inj = (input && input.injection) || null
   return {
     at: new Date().toISOString(),
@@ -70,6 +105,9 @@ export function buildProbeEntry(input) {
     messagesBefore: origIds ? origIds.length : null,
     messagesAfter: finalIds ? finalIds.length : null,
     payloadMessages: origMsgs.length,
+    // **这一步进来之前**已有的注入条数（回答"每步都注入是否重复"）
+    payloadInjected,
+    decisionInjected,
     // 处置结果
     outcome: (input && input.outcome) || null,
     // 注入摘要（**不写全文**，只写够判断的摘要 + 前 120 字预览）
