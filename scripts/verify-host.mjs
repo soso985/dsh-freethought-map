@@ -877,7 +877,8 @@ if (hostMod.__test && typeof hostMod.__test.persistDerivedTitle === 'function') 
     bad('首建之后记录不对：' + JSON.stringify(afterFirst))
   }
 
-  // ② 追加：记录已存在 → 走 update，且已有键不被覆盖（只增不减）
+  // ② 追加：记录已存在 → 走 update；新键进表，**已有的其他键保留**
+  //    （注意：同一个 eventId 的值是**以最新为准**的，见 ②′ —— 这里别写成"旧值不被覆盖"）
   T.persistDerivedTitle(domain, sid, 'evt-b', '第二个标题')
   await new Promise((r) => setTimeout(r, 0))
   const afterSecond = domain.rows.get(sid)
@@ -887,14 +888,31 @@ if (hostMod.__test && typeof hostMod.__test.persistDerivedTitle === 'function') 
     afterSecond.titles['evt-b'] === '第二个标题' &&
     domain.writes.some(([w]) => w === 'update')
   ) {
-    ok('记录已存在时走 update，且旧标题保留（只增不减）')
+    ok('记录已存在时走 update，且新键进表、其他键保留（条目不自删）')
   } else {
     bad('追加之后记录不对：' + JSON.stringify(afterSecond))
   }
 
+  // ②′ 同一个 eventId 的**值以最新为准**（不是保留原值）——
+  //     这是规格 §10.1.1 的语义，也是本文件曾经断言反了的地方。
+  T.persistDerivedTitle(domain, sid, 'evt-a', '改过的标题')
+  await new Promise((r) => setTimeout(r, 0))
+  const afterRewrite = domain.rows.get(sid)
+  if (afterRewrite && afterRewrite.titles['evt-a'] === '改过的标题') {
+    ok('同一个 eventId 以**最新派生值**为准（规则升级后旧节点能跟上，不被冻结）')
+  } else {
+    bad('同 eventId 的值没有更新成最新：' + JSON.stringify(afterRewrite && afterRewrite.titles))
+  }
+  // 缓存也要跟着更新（不能只改盘不改缓存）
+  if (T.titlesCache.get(sid) && T.titlesCache.get(sid).get('evt-a') === '改过的标题') {
+    ok('改写后内存缓存同步更新（否则同一次注入还会看到旧标题）')
+  } else {
+    bad('改写后缓存没跟上')
+  }
+
   // ③ 同一个 eventId + 同标题 → 不白写一次
   const writesBefore = domain.writes.length
-  T.persistDerivedTitle(domain, sid, 'evt-b', '第二个标题')
+  T.persistDerivedTitle(domain, sid, 'evt-a', '改过的标题')
   await new Promise((r) => setTimeout(r, 0))
   if (domain.writes.length === writesBefore) {
     ok('标题没变化时不重复写（省一次落盘）')
@@ -911,8 +929,8 @@ if (hostMod.__test && typeof hostMod.__test.persistDerivedTitle === 'function') 
     },
   }
   const idx = T.derivedTitleIndex(sid, fakeDoc)
-  if (idx['T-x'] === '第一个标题' && idx['T-y'] === '第二个标题' && idx['T-z'] === undefined) {
-    ok('读回按 node.id 建表（记过的有、没记过的没有）')
+  if (idx['T-x'] === '改过的标题' && idx['T-y'] === '第二个标题' && idx['T-z'] === undefined) {
+    ok('读回按 node.id 建表（记过的有、没记过的没有；值取最新）')
   } else {
     bad('读回索引不对：' + JSON.stringify(idx))
   }

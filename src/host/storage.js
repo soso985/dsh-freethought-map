@@ -117,8 +117,11 @@ const overlayRecordSchema = {
  * 派生标题表的记录 schema。
  *
  * 形状刻意极简：`{ version, sessionId, titles: { [eventId]: 标题 } }`。
- * **只增不减**（`titles` 累积），所以没有 `rev`/并发问题 ——
- * 每次写入都是「读回来 → 合并新标题 → 写回」，永远不会丢掉已记的。
+ *
+ * 语义（2026-09-27 与规格 §10.1.1 对齐，**这里曾经写错过**）：
+ *   · 同一个 `eventId` **以最新派生值为准**（值相同则不写盘）；
+ *   · **条目不自删** —— 已记过的键不会被移除（撤销/删除节点也不回收）。
+ * 于是写入是幂等的，不需要 `rev`/并发保护。
  */
 const titlesRecordSchema = {
   parse(raw) {
@@ -1188,7 +1191,12 @@ async function loadTitlesIntoCache(getDomain, sessionId, opts = {}) {
 }
 
 /**
- * 把派生标题**持久化**（只增不减，合并写回）。
+ * 把派生标题**持久化**。
+ *
+ * 语义（与规格 §10.1.1 对齐）：同一 `eventId` **以最新派生值为准**（值相同则不写盘）；
+ * **条目不自删**。为什么取「最新值」而不是「保留原值」：派生标题的唯一来源是原文，
+ * 原文不变 ⇒ 标题不变，平时看不出差别；但一旦 `deriveTitle` 规则升级（例如截断长度调整），
+ * 「保留原值」会让新规则对**旧节点永远不生效** —— 那是把数据冻结在旧逻辑里的技术债。
  *
  * 为什么在这里记而不是事后读会话：`Session` 的 `eventAt`/`snapshotEvents`/`ownEvents`
  * **全部 `@deprecated`** 且「new calls are prohibited」，`SessionStore` 又没有替代读面。

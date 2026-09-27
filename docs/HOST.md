@@ -742,7 +742,8 @@ displayNameOf 按 **node.id** 查表：  derived["Tc8h8lh-90f4863c-02b"] → 查
 
 **正解（不碰废弃 API）**：我们本来就实时收到每一个事件 ⇒ 在**投影那一刻**把派生标题
 记下来并持久化，重启后读回。落在**独立的表** `derived_titles`
-（`{ version, sessionId, titles: { [eventId]: 标题 } }`，只增不减 ⇒ 无 rev/并发问题）。
+（`{ version, sessionId, titles: { [eventId]: 标题 } }`；同一 `eventId` **以最新派生值为准**，
+条目**不自删** ⇒ 写入幂等、无 rev/并发问题）。
 
 规格合规：规格 §6.4 禁止的是「把派生标题写回 overlay 的 `title` 字段」（那是用户的注解字段），
 独立的表不违反那条。
