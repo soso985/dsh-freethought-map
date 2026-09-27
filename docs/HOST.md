@@ -504,6 +504,19 @@ return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
 被跳过的条数）。这是为了让"注入是否真的生效"能在**一次真实发送后立刻确认**，
 而不是只能靠读代码相信。
 
+**注入决策是纯函数（卡 5 复盘的关键改动）**：`src/overlay/inject.js` 的 `computeInjection`
+把「该不该注入、注入什么」从事件回调里抽了出来。收益：
+
+| | 抽之前 | 抽之后 |
+| --- | --- | --- |
+| 验证注入内容 | 必须真发一条消息（花 token、要人盯） | **离线验死**：假 decision + 假 payload + 一份真 overlay |
+| 验证重试复用 | 只能靠读代码 | 断言：同 `turn/step` 第二次调用 `linkCount` 不变 |
+| 验证插入位置 | 只能靠读代码 | 断言：`messages` 的 id 序列是 `['U1','注入','CTX']` |
+
+剩下唯一必须真实发送才能确认的，只有「宿主确实在真实请求上调了这个钩子」——
+那是接线问题，由 `verify-host` 的结构断言（订阅了 `agent/pre-step`、`await next()`、
+委托给 `computeInjection`）与 `verify-inject` 的行为断言两头夹住。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
