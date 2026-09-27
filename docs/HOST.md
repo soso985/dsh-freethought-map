@@ -406,6 +406,30 @@ Node 的 `fetch` **不会**自动保存 cookie，必须自己接住 303 的 `set
 
 **坑**：网关用 `Function.prototype.toString` 解析**参数名**当 wire 字段名（`dsh-api-gateway/lib/index.js:1458-1484`），所以被标记的方法参数**只能是简单标识符**（不能有默认值/解构/剩余参数），且参数名即客户端契约。
 
+### 3.11 落链所需的精确事件形状（卡 3，全部从源码核对）
+
+| 项 | 值 | 证据 |
+| --- | --- | --- |
+| 信封 | `{ type, seq, time, data, surfaceOp?, sourceEventSeqs? }`；**没有 `id` 字段** | `dsh-session/lib/index.js:1413-1419` |
+| 只有 surface 事件带 `surfaceOp` | `SURFACE_EVENT_TYPES = {system/message, developer/message, user/message, assistant/message, tool/result}`；`isSurfaceEvent` = 类型在白名单 **且** `surfaceOp !== undefined` | `dsh-session/lib/index.js:154-174` |
+| append 判据 | `isAppendSurfaceEvent(event)` ⇔ `surfaceOp === 'append'`。替换副本 `surfaceOp: {op:'replace',…}` 也会发 `session/event`，**必须排除**，否则同一结算被消费两次 | `dsh-session/lib/index.js:189` |
+| `user/message` 的 data | `{ id, role:'user', content, source, … }` → **id 在 `data.id`**；`source.kind !== 'user'` 的不算用户结算 | 官方 `dsh-client-ui-chat/lib/client.js:9200`（`String(event.data.id)`）、`:9210`（`source.kind !== "user"`） |
+| `assistant/message` 的 data | `{ turn, step, message:{id,role:'assistant',content}, stream, usage?, interrupted? }` → **id 在 `data.message.id`** | 官方 `dsh-client-ui-chat/lib/client.js:7557-7616`（`event.data.message.id`） |
+| **中终止不算成功结算** | `interrupted === true` 不建节点。官方会话控制器用同一条判据 | `dsh-api-session-controller/lib/types/…:148`（`event.data.interrupted !== true`） |
+| 事件是 fire-and-forget | post-commit，观察者抛错只记日志、**不会**让 append 失败 → 不能当门禁，且监听器绝不能把异常放出去 | `dsh-tool-cordis/lib/types/api-catalog.js:4060` |
+| `ctx.on` 是 scope-owned | **不需要**手写 `ctx.off`：监听器随 fiber 销毁。实证：全树 130+ 处 `ctx.on`，**0 处** `ctx.off` | 全树 grep |
+
+### 3.12 落链实现要点（卡 3）
+
+| 决定 | 理由 |
+| --- | --- |
+| 投影逻辑放 `src/overlay/project.js`（纯函数，零 import） | 可用**合成事件**把 D3-1~D3-8 里不依赖真实会话的部分全部钉死，不烧 token |
+| 宿主侧不做「抢焦点」判断 | 焦点是**客户端**概念（用户点了哪个节点，宿主看不见）。宿主只把节点挂对，并把 `focusHint` 回传；`followFocus` 在宿主侧一律 false |
+| 父节点用「overlay 内按 `seq` 回找」而不用 live focusId | 节点上记了投影时的 `seq`，于是「时间线前驱」是纯 overlay 运算；这**天然**满足规格 §6.5「禁止用当前 live focusId 给历史节点当父」 |
+| 投影写回走**同一个 `table.update` 写链槽位** | 与用户 save 共享 rev 序列，自动投影与手动保存不会互相覆盖（规格 §9 第 4 条） |
+| 投影 id 由 sourceRef **确定性派生** | 同一结算重试落在同一节点上，配合去重就是彻底幂等 |
+| 投影写入用一条 promise 链串行化 | 避免同源事件并发读-改-写交错 |
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）

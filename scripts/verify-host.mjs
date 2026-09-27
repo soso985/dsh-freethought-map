@@ -188,6 +188,47 @@ if (relativeOnly) {
   bad('宿主一半 import 了裸包名：' + bareImports.filter((s) => !s.startsWith('.')).join(', '))
 }
 
+// ── 5. 落链订阅的形状（卡 3）────────────────────────────────────────────────
+if (/ctx\.on\(\s*'session\/event'/.test(hostSource)) {
+  ok("用 ctx.on('session/event', …) 订阅结算事件")
+} else {
+  bad("没有订阅 'session/event' —— 落链不会发生")
+}
+// Cordis 的 ctx.on 是 scope-owned，卸载时自动移除；全树官方包 130+ 处 ctx.on 无一处配 ctx.off。
+// 所以这里断言的是「**不要**手写 ctx.off」—— 名字对不上会在卸载路径上抛错。
+//
+// ⚠️ 必须先把注释剥掉再判：解释「为什么不用 ctx.off」的注释本身就含 `ctx.off(`，
+// 直接 grep 会把它当成真实代码误报（本轮第二次踩这个坑，verify-client 里也踩过一次）。
+const hostCode = hostSource
+  .split(/\r?\n/)
+  .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+  .join('\n')
+if (/ctx\.off\(/.test(hostCode)) {
+  bad('手写了 ctx.off —— Cordis 的 ctx.on 已随 fiber 自动销毁，手写反而可能在卸载时抛错')
+} else {
+  ok('没有手写 ctx.off（依赖 Cordis 的 scope-owned 监听器）')
+}
+if (hostSource.includes("inject = ['storageDomain', 'sessions']")) {
+  ok("声明了 inject = ['storageDomain', 'sessions']（事件源与存储都是硬依赖）")
+} else {
+  bad('inject 声明与预期不符 —— 事件源缺失会让落链静默不发生')
+}
+if (/settlementKindOf\(event\)/.test(hostSource)) {
+  ok('落链前先用 settlementKindOf 过滤（只认 append 结算，排除替换副本/中止/工具过程）')
+} else {
+  bad('没有做 append-结算过滤 —— 替换副本会把同一结算消费两次')
+}
+if (/table\.update\(/.test(hostSource) && /projectOne/.test(hostSource)) {
+  ok('投影写回走 table.update 写链槽位（与用户 save 共享 rev 序列）')
+} else {
+  bad('投影没有走写链槽位 —— 与 save 并发时会互相覆盖')
+}
+if (/projectionChain/.test(hostSource)) {
+  ok('投影写入串行化（避免同源事件并发读-改-写交错）')
+} else {
+  bad('投影没有串行化')
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 const fails = results.filter(([s]) => s === 'FAIL')
 const pad = Math.max(...results.map(([, m]) => m.length))

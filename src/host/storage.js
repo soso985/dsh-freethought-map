@@ -22,6 +22,12 @@
  */
 
 import { SAVE_CONFLICT, SAVE_OK, SAVE_REJECTED, applySave, createOverlay, validateOverlay } from '../overlay/index.js'
+import {
+  SettlementLog,
+  applyProjection,
+  planProjection,
+  settlementKindOf,
+} from '../overlay/project.js'
 
 /**
  * 领域层与 json 后端实际强制执行的名称正则（`dsh-storage/lib/index.js:80`）：
@@ -228,10 +234,33 @@ class FreethoughtMapHostService {
       service: SERVICE_KEY,
     }
   }
+
+  /**
+   * 读某个会话最近见过的结算事件（卡 3 的验收面）。
+   *
+   * 为什么需要这个出口：只看 overlay 分不清「宿主没收到事件」和「收到了但按去重/摘除
+   * 跳过了」。有了它，验收脚本能把「事件流」与「图」两侧对齐着看。
+   *
+   * @param {string} sessionId
+   * @param {number} sinceSeq
+   */
+  async events(sessionId, sinceSeq) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    const since = Number.isInteger(sinceSeq) ? sinceSeq : -1
+    return { ok: true, entries: settlementLog.list(sessionId, since) }
+  }
 }
 
-// 端点名由 marker 决定：freethoughtMap/load、freethoughtMap/save、freethoughtMap/describe。
-markRemoteMethods(FreethoughtMapHostService, ['load', 'save', 'describe'])
+/**
+ * 结算事件环形缓冲：host 侧单例，记录每个会话见过的结算与处置结果。
+ * 放在模块级是因为它只是诊断面，生命周期跟着进程走即可。
+ */
+const settlementLog = new SettlementLog(200)
+
+// 端点名由 marker 决定：freethoughtMap/load、freethoughtMap/save、freethoughtMap/describe、freethoughtMap/events。
+markRemoteMethods(FreethoughtMapHostService, ['load', 'save', 'describe', 'events'])
 
 function describeError(e) {
   if (!e) return 'unknown'
@@ -306,8 +335,10 @@ function log(ctx, message) {
  * `storageDomain` 由 `@deepseek-ai/dsh-storage-domain` 提供，而它在 `dsh-base` 的 bundle 里
  * 是默认挂载的（config: `backend: json`，root 指向 `$DSH_HOME/storages`），所以 web profile
  * 一定有它。真遇到没有它的 profile，让这一行明确失败比默默降级更好排查。
+ *
+ * `sessions` 是会话事件源（`'session/event'` 从它上面发），用于卡 3 的落链订阅。
  */
-export const inject = ['storageDomain']
+export const inject = ['storageDomain', 'sessions']
 
 /**
  * 宿主插件入口。
@@ -384,11 +415,205 @@ export function apply(ctx) {
     'freethought-map: host service',
   )
 
+  // (c) 落链：订阅会话事件，把结算投影成链（卡 3 / 规格 §6.3–6.5）。
+  //
+  // 事件名与服务都有实证：`'session/event'(session, event)`，服务 `ctx.sessions`
+  // （`dsh-tool-cordis/lib/types/api-catalog.js:4056-4061`；监听实证 `dsh-agent-loop/lib/index.js:319`）。
+  //
+  // 三条纪律：
+  //   1. 只认 `isAppendSurfaceEvent`（surfaceOp === 'append'）。替换副本也会发同一个事件，
+  //      不过滤就会把同一个结算消费两次。
+  //   2. 事件是 **post-commit、fire-and-forget**：观察者抛错只记日志，不会让 append 失败
+  //      （`api-catalog.js:4060`）。所以这里**绝不能让异常逃出去**，更不能拿它当门禁。
+  //   3. 投影写回走**同一个 `update` 写链槽位**，与 save 共享 rev 序列 —— 否则用户保存与
+  //      自动投影会互相覆盖（规格 §9 第 4 条）。
+  ctx.effect(
+    () => {
+      const onSessionEvent = (session, event) => {
+        try {
+          const kind = settlementKindOf(event)
+          if (!kind) return // 不是 append 结算：stream 帧、工具过程、替换副本、失败尝试
+          const sessionId = sessionIdOf(session)
+          if (!sessionId) {
+            settlementLog.record('?', event, 'no-session-id')
+            return
+          }
+          // 投影是异步的（要等领域句柄），且必须串行 —— 用一条 promise 链排队
+          projectionChain = projectionChain
+            .then(() => projectOne(ctx, getDomain, sessionId, event, kind))
+            .catch((e) => {
+              settlementLog.record(sessionId, event, 'error:' + describeError(e))
+              log(ctx, '投影失败（已隔离，不影响会话）：' + describeError(e))
+            })
+        } catch (e) {
+          // 连判断都炸了也不能让它冒出去 —— 那会污染别人的 session/event 监听
+          log(ctx, '处理 session/event 时抛错（已吞掉）：' + describeError(e))
+        }
+      }
+
+      ctx.on('session/event', onSessionEvent)
+      // **不写 `ctx.off(...)`**：Cordis 的 `ctx.on` 是 scope-owned —— 监听器随当前 fiber
+      // 一起销毁，`ctx.effect` 的返回值只需要清理「Cordis 不管的东西」（DOM 监听、定时器）。
+      // 实证：全树 23 个官方包、130+ 处 `ctx.on`，**没有一处**配套 `ctx.off`。
+      // 手写 `ctx.off` 反而有风险：名字/签名对不上时会在卸载路径上抛错。
+      return undefined
+    },
+    'freethought-map: settlement projection',
+  )
+
   log(ctx, '宿主一半已激活：overlay 权威存储就绪（dsh 0.1.7-rc.2 c1275515）')
+}
+
+/** 投影写入串行化：避免同一条事件被并发应用导致读-改-写交错。 */
+let projectionChain = Promise.resolve()
+
+/** 从 `session` 参数里取会话 id，兼容对象与字符串两种形态。 */
+function sessionIdOf(session) {
+  if (!session) return null
+  if (typeof session === 'string') return session
+  if (session.header && typeof session.header.id === 'string') return session.header.id
+  if (typeof session.id === 'string') return session.id
+  return null
+}
+
+/**
+ * 把一条结算事件投影进权威 overlay。
+ *
+ * 全程在**一个 `update` 槽位**里完成「读 → 判断 → 写」，所以：
+ *   · 自动投影与用户 save 共享 rev 序列，不会互相覆盖；
+ *   · 两条事件并发到达也不会交错。
+ *
+ * 父节点怎么定（规格 §6.4 / §6.5）：
+ *   · user 结算   —— 上行是从 canonical 来的，历史补链用它；实时到达时用
+ *                    「时间线上前一个未隐藏 turn」。
+ *                    ⚠️ **不用 live focusId**：焦点是客户端概念，宿主看不到，
+ *                    也正因如此这里天然满足「禁止用此刻 focusId 兜底」。
+ *   · assistant 结算 —— 用「该 assistant 之前最近一条 user 投影」。
+ *
+ * 焦点跟随（抢焦点规则）由**客户端**实现：只有客户端知道用户此刻点在哪。
+ * 宿主只负责把节点挂对，并把「该不该跟随」写成 `focusHint` 一起返回。
+ */
+async function projectOne(ctx, getDomain, sessionId, event, kind) {
+  const domain = await getDomain()
+  const table = domain.table(TABLE)
+
+  let current = table.get(sessionId)
+  if (current === undefined || current === null) {
+    current = createOverlay(sessionId)
+    await table.put(sessionId, current)
+  }
+
+  let outcome = 'noop'
+  let focusHint = null
+
+  await table.update(sessionId, (authoritative) => {
+    // 时间线前驱：按 seq 找最近的、未被摘除的 turn 节点
+    // 这里没有事件全集，所以用 overlay 里的节点 + 它们的 seq 记账（见 seqOf 注释）
+    const prevTurnId = timelinePrevTurn(authoritative, event)
+    const userNodeIdForAssistant =
+      kind === 'assistant-settlement' ? nearestUserTurnBefore(authoritative, event) : undefined
+
+    const plan = planProjection(authoritative, event, {
+      prevTurnId,
+      ...(userNodeIdForAssistant !== undefined ? { userNodeIdForAssistant } : {}),
+    })
+
+    if (plan.action !== 'append-turn') {
+      outcome = plan.reason || 'noop'
+      return authoritative
+    }
+
+    // 宿主侧不做「抢焦点」判断（那是客户端的事），所以 followFocus 一律 false，
+    // 只把建议通过 focusHint 回传。
+    const projected = applyProjection(
+      authoritative,
+      { ...plan, followFocus: false },
+      { newId: () => newIdFor(sessionId, event) },
+    )
+    const newNodeId = Object.keys(projected.nodes).find((id) => !authoritative.nodes[id])
+    if (newNodeId) {
+      projected.nodes[newNodeId] = { ...projected.nodes[newNodeId], seq: Number(event.seq) || 0 }
+      focusHint = { nodeId: newNodeId, kind: plan.kind, suggested: plan.followFocus }
+    }
+    outcome = 'appended'
+    return projected
+  })
+
+  settlementLog.record(sessionId, event, outcome)
+  return { outcome, focusHint }
+}
+
+/**
+ * 从 deterministic 的 id 生成器：同一 sourceRef 永远得到同一个 id。
+ *
+ * 为什么不用随机 id：投影可能因为重试被跑两次；用 sourceRef 派生 id，
+ * 第二次天然落在同一个节点上（配合去重就是彻底的幂等）。
+ */
+function newIdFor(sessionId, event) {
+  const kind = settlementKindOf(event) || 'x'
+  const eventId = String(
+    (event.data && (event.data.id || (event.data.message && event.data.message.id))) ||
+      'seq' + String(event.seq),
+  )
+  const raw = kind + ':' + eventId + ':' + sessionId
+  let hash = 0
+  for (let i = 0; i < raw.length; i += 1) {
+    hash = (hash * 31 + raw.charCodeAt(i)) | 0
+  }
+  return 'T' + (hash >>> 0).toString(36) + '-' + eventId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 12)
+}
+
+/**
+ * 时间线前驱：seq 小于本条事件、且未被摘除的最近一个 turn 节点。
+ *
+ * 节点上的 `seq` 是投影时记下的（见 projectOne），所以这个查找是纯 overlay 内的运算，
+ * 不需要把整段会话日志拿在手里。
+ */
+function timelinePrevTurn(doc, event) {
+  const seq = Number(event.seq)
+  if (!Number.isFinite(seq)) return null
+  let best = null
+  let bestSeq = -Infinity
+  for (const node of Object.values(doc.nodes)) {
+    if (node.kind !== 'turn') continue
+    const s = Number(node.seq)
+    if (!Number.isFinite(s) || s >= seq) continue
+    if (s > bestSeq) {
+      bestSeq = s
+      best = node.id
+    }
+  }
+  return best
+}
+
+/** 该 assistant 事件之前最近的一条 user 投影（助手节点要挂到它下面）。 */
+function nearestUserTurnBefore(doc, event) {
+  const seq = Number(event.seq)
+  let best = null
+  let bestSeq = -Infinity
+  for (const node of Object.values(doc.nodes)) {
+    if (node.kind !== 'turn') continue
+    if (!node.sourceRef || node.sourceRef.kind !== 'user-message') continue
+    const s = Number(node.seq)
+    if (Number.isFinite(seq) && (!Number.isFinite(s) || s >= seq)) continue
+    if (s > bestSeq) {
+      bestSeq = s
+      best = node.id
+    }
+  }
+  return best
 }
 
 /**
  * 只给测试用的内部导出（`scripts/verify-host.mjs` 用它验证领域 spec 的合法性，
  * 而不必真的打开一个存储领域）。生产路径不依赖它。
  */
-export const __test = { makeDomainSpec, overlayRecordSchema, markRemoteMethods, REMOTE_METHOD_DESCRIPTOR }
+export const __test = {
+  makeDomainSpec,
+  overlayRecordSchema,
+  markRemoteMethods,
+  REMOTE_METHOD_DESCRIPTOR,
+  newIdFor,
+  timelinePrevTurn,
+  nearestUserTurnBefore,
+}
