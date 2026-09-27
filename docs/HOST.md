@@ -430,6 +430,41 @@ Node 的 `fetch` **不会**自动保存 cookie，必须自己接住 303 的 `set
 | 投影 id 由 sourceRef **确定性派生** | 同一结算重试落在同一节点上，配合去重就是彻底幂等 |
 | 投影写入用一条 promise 链串行化 | 避免同源事件并发读-改-写交错 |
 
+### 3.13 卡 4 双向定位的落地形态与脆弱点
+
+| 方向 | 结论 | 实现 |
+| --- | --- | --- |
+| 图 → 官方气泡 | **可行但脆弱** | `src/overlay/locate.js` 的 `locateBubble` / `scrollToBubble`。**这是全项目唯一直接读宿主内部 DOM 的地方** |
+| 官方气泡 → 图 | **不做** | 卡 1 判定无 inbound 回调；唯一途径是 keyed slot 影子替换官方 renderer，会连带接管官方渲染 → 违反红线，**明确不采用、不留"以后再修"的假象** |
+
+**用到的 DOM 契约（非公开承诺）**：
+
+```
+mergedNode.key = conversationContextKey(kind, id) = `${kind.length}:${kind}${id}`
+  —— dsh-client-ui-conversation/lib/client.js 的 conversationContextKey
+渲染成 data-chat-node-key={routedNode.key}
+  —— dsh-client-ui-chat/lib/client.js（"data-chat-node-key": routedNode.key）
+```
+
+其中 `kind` 是**官方 Definition 的 kind**（user 气泡是 `input-message`），不是我们的 kind。
+所以选择器**三级降级**，并且：
+
+| 规则 | 理由 |
+| --- | --- |
+| 只用**属性选择器**，绝不碰 CSS module 哈希类名（`fq8vsa_flowItem` 那种） | 哈希类名每次构建都变 |
+| assistant 结算**不构造精确 key** | 官方 assistant 的 key 用 `${turn}:${step}` 一类的 id，我们不去猜 |
+| 命中**多个**返回 `ambiguous` 而不是取第一个 | **跳到错的气泡比找不到更糟** |
+| 找不到返回 `not-found`，UI 显示可见提示 | 绝不静默失败 |
+| 高亮用**内联样式 + 按时还原** | 不注入样式表、不留全局 class、不永久改宿主元素的 outline |
+| 手建节点返回 `no-source-ref`（不是 not-found） | 它本来就没有对应气泡，语义不同 |
+
+**焦点与选中分离（规格 §5）**：`applySelection` 是纯函数并单测 —— 框选只改 `selectedIds`；
+**点空白取消选中但保留 `focusId`**。这条最容易写成"点一下就同时设两个"。
+
+**代码复制的安全性**：客户端 bundle 不能 import 相对模块，所以 `bubbleSelectorCandidates` /
+`locateBubble` / `buildChainView` 被**逐字复制**进 `client/index.js`。
+`scripts/verify-host.mjs` 会把两份源码的函数体抽出来逐字比对 —— 复制不会悄悄分叉。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
