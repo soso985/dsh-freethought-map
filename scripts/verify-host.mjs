@@ -833,6 +833,122 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
   }
 }
 
+// ── 派生标题：用**假存储域**驱动真代码，覆盖真机曾失败的那条路径 ──────────────
+//
+// 为什么必须驱动真代码而不是只查源码：真机上 `table.update` 在记录不存在时抛
+// `missing-key`（见 d2fe017），而当时**没有任何断言**覆盖「首建」这条分支 ——
+// 源码里明明写着 `table.update(...)`，看起来完全正常。
+// 所以这里造一个「像真领域那样对不存在的记录抛错」的假域，把两条分支都跑一遍。
+if (hostMod.__test && typeof hostMod.__test.persistDerivedTitle === 'function') {
+  const T = hostMod.__test
+
+  /** 假存储域：语义对齐真领域的两条关键行为。 */
+  function makeFakeDomain() {
+    const rows = new Map()
+    const writes = []
+    const table = {
+      get: (k) => rows.get(k),
+      put: (k, v) => {
+        rows.set(k, v)
+        writes.push(['put', k])
+        return Promise.resolve()
+      },
+      update: (k, fn) => {
+        if (!rows.has(k)) {
+          // 真机就是抛这个；假域必须照抄，否则测不出首建那类 bug
+          writes.push(['update-rejected', k])
+          return Promise.reject(new Error('missing-key: no record to update'))
+        }
+        rows.set(k, fn(rows.get(k)))
+        writes.push(['update', k])
+        return Promise.resolve()
+      },
+    }
+    return { rows, writes, table: () => table }
+  }
+
+  const sid = 'session-fake-1'
+  const domain = makeFakeDomain()
+  T.titlesCache.delete(sid)
+
+  // ① 首建：记录不存在 → 必须走 put，**且绝不能碰 update**
+  //
+  // 注意这里为什么断言「writes 里没有 update」而不是「没有 update-rejected」：
+  // 早先那版只查 update-rejected，而变异测试证明那是**恒真**的 ——
+  // 把代码改成 `true ? put : update` 时 put 仍被调用，于是永远不红。
+  // 现在直接看假域收到的写操作序列，任何一次 update 都算失败。
+  T.persistDerivedTitle(domain, sid, 'evt-a', '第一个标题')
+  await new Promise((r) => setTimeout(r, 0))
+  const afterFirst = domain.rows.get(sid)
+  const firstUpdates = domain.writes.filter(([w]) => w === 'update' || w === 'update-rejected')
+  if (firstUpdates.length > 0) {
+    bad('首建时碰到了 update（' + JSON.stringify(firstUpdates) + '）—— 真机上会撞 missing-key')
+  } else if (domain.writes.length === 0) {
+    bad('首建什么都没写（假域没收到任何写操作）')
+  } else if (afterFirst && afterFirst.titles && afterFirst.titles['evt-a'] === '第一个标题') {
+    ok('首建只走 put 成功落盘（记录不存在时不会撞 missing-key）')
+  } else {
+    bad('首建之后记录不对：' + JSON.stringify(afterFirst))
+  }
+
+  // ② 追加：记录已存在 → 走 update，且已有键不被覆盖（只增不减）
+  T.persistDerivedTitle(domain, sid, 'evt-b', '第二个标题')
+  await new Promise((r) => setTimeout(r, 0))
+  const afterSecond = domain.rows.get(sid)
+  if (
+    afterSecond &&
+    afterSecond.titles['evt-a'] === '第一个标题' &&
+    afterSecond.titles['evt-b'] === '第二个标题' &&
+    domain.writes.some(([w]) => w === 'update')
+  ) {
+    ok('记录已存在时走 update，且旧标题保留（只增不减）')
+  } else {
+    bad('追加之后记录不对：' + JSON.stringify(afterSecond))
+  }
+
+  // ③ 同一个 eventId + 同标题 → 不白写一次
+  const writesBefore = domain.writes.length
+  T.persistDerivedTitle(domain, sid, 'evt-b', '第二个标题')
+  await new Promise((r) => setTimeout(r, 0))
+  if (domain.writes.length === writesBefore) {
+    ok('标题没变化时不重复写（省一次落盘）')
+  } else {
+    bad('标题没变化却又写了一次')
+  }
+
+  // ④ 读回：按 node.id 建表，没记过的节点不该被硬编
+  const fakeDoc = {
+    nodes: {
+      'T-x': { id: 'T-x', sourceRef: { kind: 'user-message', eventId: 'evt-a' } },
+      'T-y': { id: 'T-y', sourceRef: { kind: 'user-message', eventId: 'evt-b' } },
+      'T-z': { id: 'T-z', sourceRef: { kind: 'user-message', eventId: 'evt-没记过' } },
+    },
+  }
+  const idx = T.derivedTitleIndex(sid, fakeDoc)
+  if (idx['T-x'] === '第一个标题' && idx['T-y'] === '第二个标题' && idx['T-z'] === undefined) {
+    ok('读回按 node.id 建表（记过的有、没记过的没有）')
+  } else {
+    bad('读回索引不对：' + JSON.stringify(idx))
+  }
+
+  // ⑤ 坏输入不该抛（标题失败绝不能影响落链/注入）
+  let threw = null
+  try {
+    T.persistDerivedTitle(null, sid, 'e', 't')
+    T.persistDerivedTitle(domain, '', 'e', 't')
+    T.persistDerivedTitle(domain, sid, '', 't')
+    T.persistDerivedTitle(domain, sid, 'e', '')
+  } catch (e) {
+    threw = e
+  }
+  if (threw === null) ok('坏输入（无域 / 空 sessionId / 空 eventId / 空标题）都不抛错')
+  else bad('坏输入抛错了：' + threw.message)
+
+  T.titlesCache.delete(sid)
+} else {
+  bad('__test 没导出 persistDerivedTitle —— 无法离线驱动首建分支')
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 const fails = results.filter(([s]) => s === 'FAIL')
 const pad = Math.max(...results.map(([, m]) => m.length))

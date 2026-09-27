@@ -1263,7 +1263,17 @@ function persistDerivedTitle(domain, sessionId, eventId, title) {
     const table = domain.table(TITLES_TABLE)
     const existing = table.get(sessionId)
     const titles = existing && existing.titles ? { ...existing.titles } : {}
-    if (titles[eventId] === title) return // 没变化，别白写一次
+    // 先把**内存缓存**更新掉，再落盘。
+    //
+    // 为什么必须在这里更新（而不是让调用方自己补）：`derivedTitleIndex` 是**同步**的，
+    // 它只读缓存。这里不更新的话，**同一次注入**就看不到刚记下的标题 ——
+    // 刚投影出来的节点会在它自己的注入里显示「（未命名）」。
+    // 这个疏漏是「用假存储域驱动真代码」的离线断言抓到的，不是真机。
+    const cached = titlesCache.get(sessionId) || new Map()
+    if (cached.get(String(eventId)) === title && titles[eventId] === title) return // 没变化，别白写
+    cached.set(String(eventId), title)
+    titlesCache.set(sessionId, cached)
+
     titles[eventId] = title
     const record = { version: 1, sessionId, titles }
     // 记录不存在 → 首次创建（put）；已存在 → 走 update 的写链槽位（与别的写入串行）
@@ -1345,9 +1355,17 @@ function nearestUserTurnBefore(doc, event) {
 export const __test = {
   makeDomainSpec,
   overlayRecordSchema,
+  titlesRecordSchema,
   markRemoteMethods,
   REMOTE_METHOD_DESCRIPTOR,
   newIdFor,
   timelinePrevTurn,
   nearestUserTurnBefore,
+  // 派生标题那一层：导出是为了能用**假存储域**离线驱动「首建」分支 ——
+  // 真机曾经在这里失败（`table.update` 不建记录，抛 missing-key），
+  // 而当时这条路径没有任何断言覆盖得到。
+  persistDerivedTitle,
+  derivedTitleIndex,
+  titlesCache,
+  TITLES_TABLE,
 }
