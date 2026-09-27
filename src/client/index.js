@@ -119,6 +119,7 @@ function buildRemoteContribution() {
       mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
       mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
       mk('titles', [remoteParam('sessionId')]),
+      mk('importTitles', [remoteParam('sessionId'), remoteParam('titles')]),
     ],
   }
 }
@@ -654,16 +655,26 @@ function createPlugin(React) {
       const loadDerivedTitles = useCallback(
         (sid) => {
           if (!sid) return
-          // 需要 doc 才能把 eventId 映射到 node.id。并行取两样，然后按 doc 建表。
+          // 需要 doc 才能把 eventId 映射到 node.id。三个都取，然后按 doc 建表：
+          //   · titles —— **持久化**的派生标题（跨宿主重启仍在），首选
+          //   · events —— 内存结算日志（只覆盖本进程见过的），兜底
+          //   · load   —— 权威 overlay（拿 node.id ↔ sourceRef.eventId 的对应）
+          //
+          // ⚠️ 早先只读 `events`。宿主一重启日志就空 ⇒ 面板全变「（无标题）」。
+          //    持久化那一侧修好之后，客户端不读它照样是空的 —— 两侧都要接。
           Promise.all([
+            callRemote(ctx, 'titles', { sessionId: sid }),
             callRemote(ctx, 'events', { sessionId: sid, sinceSeq: -1 }),
             callRemote(ctx, 'load', { sessionId: sid }),
-          ]).then(([re, rl]) => {
+          ]).then(([rt, re, rl]) => {
+            const persisted = rt && rt.ok === true && rt.value && rt.value.titles ? rt.value.titles : {}
             const entries = re && re.ok === true && re.value ? re.value.entries || [] : []
             const doc = rl && rl.ok === true && rl.value && rl.value.doc ? rl.value.doc : null
-            const byEvent = new Map()
+            const byEvent = new Map(Object.entries(persisted))
             for (const e of entries) {
-              if (e && e.eventId && e.title) byEvent.set(String(e.eventId), String(e.title))
+              if (e && e.eventId && e.title && !byEvent.has(String(e.eventId))) {
+                byEvent.set(String(e.eventId), String(e.title))
+              }
             }
             const idx = {}
             if (doc && doc.nodes) {

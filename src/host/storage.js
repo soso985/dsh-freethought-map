@@ -235,6 +235,61 @@ class FreethoughtMapHostService {
   }
 
   /**
+   * 写入/合并派生标题（**只增不减**，与内部 `persistDerivedTitle` 同一形状）。
+   *
+   * 用途：
+   *   1. 验收 —— 不需要真实发送就能验证「持久化标题在重启后仍被读回」
+   *      （见 `scripts/live-verify-titles.mjs`）；
+   *   2. 日后「标题随导出/导入一起走」的接口基础。
+   *
+   * 合并语义与内部一致：已有的键**不覆盖**（标题是历史的，不该被后来的覆盖）。
+   *
+   * @param {string} sessionId
+   * @param {Record<string, string>} titles 形如 `{ [eventId]: 标题 }`
+   */
+  async importTitles(sessionId, titles) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    if (!titles || typeof titles !== 'object' || Array.isArray(titles)) {
+      return { ok: false, error: 'titles 必须是以 eventId 为键的对象' }
+    }
+    for (const [k, v] of Object.entries(titles)) {
+      if (typeof k !== 'string' || !k) return { ok: false, error: 'title 的键必须是非空字符串' }
+      if (typeof v !== 'string' || !v) return { ok: false, error: 'title 的值必须是非空字符串（键 ' + k + '）' }
+    }
+    const domain = await readyDomain(this.getDomain)
+    if (!domain) return { ok: false, error: '存储领域尚未就绪' }
+
+    let added = 0
+    let kept = 0
+    try {
+      const table = domain.table(TITLES_TABLE)
+      const existing = table.get(sessionId)
+      const merged = existing && existing.titles ? { ...existing.titles } : {}
+      for (const [k, v] of Object.entries(titles)) {
+        if (merged[k] === undefined) {
+          merged[k] = v
+          added += 1
+        } else {
+          kept += 1 // 已有 → 保留原值（只增不减）
+        }
+      }
+      const record = { version: 1, sessionId, titles: merged }
+      // ⚠️ `update` 不会创建记录（记录不存在时抛 missing-key）—— 首建要用 `put`。
+      // 真机实测撞到过，见 `persistDerivedTitle` 的注释。
+      if (existing === undefined || existing === null) await table.put(sessionId, record)
+      else await table.update(sessionId, () => record)
+    } catch (e) {
+      return { ok: false, error: describeError(e) }
+    }
+    // 顺手刷新缓存，免得还要等下一次预热
+    await loadTitlesIntoCache(this.getDomain, sessionId, { force: true })
+    const cached = titlesCache.get(sessionId)
+    return { ok: true, added, kept, total: cached ? cached.size : 0 }
+  }
+
+  /**
    * 读某个会话的**派生标题表**（`eventId → 派生标题`）。
    *
    * 也把结果灌进内存缓存（`titlesCache`），让同步调用的 `derivedTitleIndex` 能用上。
@@ -565,6 +620,7 @@ markRemoteMethods(FreethoughtMapHostService, [
   'importDoc',
   'rebuild',
   'titles',
+  'importTitles',
 ])
 
 function describeError(e) {
@@ -622,6 +678,7 @@ export function buildRemoteContribution() {
       mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
       mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
       mk('titles', [remoteParam('sessionId')]),
+      mk('importTitles', [remoteParam('sessionId'), remoteParam('titles')]),
     ],
   }
 }
@@ -1190,6 +1247,11 @@ async function loadTitlesIntoCache(getDomain, sessionId, opts = {}) {
  * **全部 `@deprecated`** 且「new calls are prohibited」，`SessionStore` 又没有替代读面。
  * 而我们本来就实时收到每一个事件 —— 在投影那一刻记下来最省事，也不碰废弃 API。
  *
+ * ⚠️ **`table.update` 不会自动创建记录**：记录不存在时它抛
+ * `missing-key: … has no record … to update`（真机实测撞到，2026-09-27）。
+ * 所以这里必须区分「首建」与「更新」——
+ * 这个 bug 光靠离线断言看不出来，只有真机跑一次才暴露。
+ *
  * @param {any} domain 已打开的领域句柄
  * @param {string} sessionId
  * @param {string} eventId
@@ -1203,10 +1265,13 @@ function persistDerivedTitle(domain, sessionId, eventId, title) {
     const titles = existing && existing.titles ? { ...existing.titles } : {}
     if (titles[eventId] === title) return // 没变化，别白写一次
     titles[eventId] = title
-    // 走 update 的写链槽位（与别的写入串行），并且只增不减所以不怕覆盖
-    void table
-      .update(sessionId, () => ({ version: 1, sessionId, titles }))
-      .catch((e) => warnTitleFailure('写', describeError(e)))
+    const record = { version: 1, sessionId, titles }
+    // 记录不存在 → 首次创建（put）；已存在 → 走 update 的写链槽位（与别的写入串行）
+    const write =
+      existing === undefined || existing === null
+        ? table.put(sessionId, record)
+        : table.update(sessionId, () => record)
+    void Promise.resolve(write).catch((e) => warnTitleFailure('写', describeError(e)))
   } catch (e) {
     warnTitleFailure('写', describeError(e))
   }

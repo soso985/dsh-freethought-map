@@ -746,6 +746,57 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
   } else {
     bad('投影时没有持久化派生标题 —— 重启后仍会全失效')
   }
+  // ⚠️ `table.update` **不会创建记录**（记录不存在时抛 missing-key）——
+  // 真机实测撞到：标题表第一次写入必然失败，而离线断言看不出来。
+  // 所以首建必须走 `put`。
+  {
+    const start = hostSource.indexOf('function persistDerivedTitle(')
+    const braceStart = hostSource.indexOf('{', start)
+    let depth = 0
+    let body = ''
+    for (let i = braceStart; i < hostSource.length; i += 1) {
+      const ch = hostSource[i]
+      if (ch === '{') depth += 1
+      else if (ch === '}') {
+        depth -= 1
+        if (depth === 0) {
+          body = hostSource.slice(braceStart, i + 1)
+          break
+        }
+      }
+    }
+    if (!body) {
+      bad('抽不出 persistDerivedTitle 函数体')
+    } else if (/table\.put\(/.test(body) && /table\.update\(/.test(body) && /existing === undefined/.test(body)) {
+      ok('标题持久化区分「首建用 put」与「更新用 update」（`update` 不创建记录，首建会抛 missing-key）')
+    } else {
+      bad('标题持久化没有区分首建/更新 —— 首次写入会因 `update` 找不到记录而失败')
+    }
+  }
+
+  // `importTitles` 是验收/导入用的写入口，也要区分首建与更新（同一个坑）
+  {
+    const start = hostSource.indexOf('async importTitles(')
+    const braceStart = hostSource.indexOf('{', start)
+    let depth = 0
+    let body = ''
+    for (let i = braceStart; i < hostSource.length; i += 1) {
+      const ch = hostSource[i]
+      if (ch === '{') depth += 1
+      else if (ch === '}') {
+        depth -= 1
+        if (depth === 0) {
+          body = hostSource.slice(braceStart, i + 1)
+          break
+        }
+      }
+    }
+    if (body && /table\.put\(/.test(body) && /table\.update\(/.test(body)) {
+      ok('importTitles 同样区分首建/更新')
+    } else {
+      bad('importTitles 没有区分首建/更新 —— 首次导入会失败')
+    }
+  }
   if (/titlesCache/.test(hostSource) && /loadTitlesIntoCache\(/.test(hostSource)) {
     ok('有内存缓存 + 预热函数（derivedTitleIndex 是同步的，必须先异步灌一次）')
   } else {
@@ -762,6 +813,23 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
     ok('derivedTitleIndex 同时取「持久化标题」与「结算日志」，前者优先')
   } else {
     bad('derivedTitleIndex 没有合并两个来源')
+  }
+
+  // ⚠️ 客户端也必须读持久化那一侧。
+  // 真机实测踩到过：宿主持久化修好了，但客户端仍只读 `events`（内存日志），
+  // 于是重启后面板照样全「（无标题）」—— **两侧都要接**。
+  {
+    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
+    if (/callRemote\(ctx, 'titles'/.test(clientSource)) {
+      ok("客户端 `loadDerivedTitles` 也读持久化的 `titles` 端点（只读 events 会在重启后全空）")
+    } else {
+      bad("客户端没有读 `titles` 端点 —— 宿主持久化了面板也照样是「（无标题）」")
+    }
+    if (/byEvent = new Map\(Object\.entries\(persisted\)\)/.test(clientSource)) {
+      ok('客户端按「持久化优先、日志兜底」合并两个来源')
+    } else {
+      bad('客户端没有把持久化标题放在优先位')
+    }
   }
 }
 
