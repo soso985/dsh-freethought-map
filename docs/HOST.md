@@ -465,6 +465,45 @@ mergedNode.key = conversationContextKey(kind, id) = `${kind.length}:${kind}${id}
 `locateBubble` / `buildChainView` 被**逐字复制**进 `client/index.js`。
 `scripts/verify-host.mjs` 会把两份源码的函数体抽出来逐字比对 —— 复制不会悄悄分叉。
 
+### 3.14 发送前注入的接线与纪律（卡 5）
+
+**事件形状**（`dsh-tool-cordis/lib/types/api-catalog.js` 的 `'agent/pre-step'`）：
+
+```
+mode: waterfall
+'agent/pre-step'(
+  payload: { agent, messages: UserMessage[], turn: number, step: number, signal: AbortSignal },
+  next: () => Promise<PreStepDecision>
+): Promise<PreStepDecision>
+
+PreStepDecision = { kind: 'reject' } | { kind: 'enter', messages: UserMessage[], startsRequestSeries?: true }
+```
+
+| 纪律 | 理由 | 断言 |
+| --- | --- | --- |
+| **必须 `await next()`** | 不调就吞掉下游所有 listener 的决策 | `verify-host` 有断言 |
+| 返回时是**整体替换** `messages` | 所以要自己保留原数组：`{ ...decision, messages }` | 有断言（含"必须展开 decision"） |
+| 注入消息插在**已接纳的用户消息之后** | 官方 `dsh-agent-instructions` 用 `toSpliced(lastClaimedIndex + 1, 0, desired)` 就是这个位置 | `spliceInjectionAfterClaimed` + 单测 |
+| **不调 `followup()`** | 红线：拉线不唤醒模型 | 有断言 |
+| **不原地改写 `messages`** | 要产新数组 | 有断言 |
+
+**注入消息的形状**：宿主 `createUserMessage` 在 `@deepseek-ai/dsh-llm` 里，而宿主 runtime
+解析不到裸包名（§3.9）。好在它的实现极简 —— `dsh-llm/lib/index.js` 的 `createMessage`：
+
+```js
+return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
+```
+
+所以 `makeInjectedUserMessage` 复制同一件事：克隆 → 补 `id` → 深冻结。`UserMessage` 本身
+只要求 `role: 'user'`（`interface UserMessage extends MessageBase { readonly role: 'user' }`）。
+
+**重试复用同一份快照**（规格 §10.3）：key 用 `${sessionId}:${turn}:${step}` ——
+官方重试同一次发送时 turn/step 不变，所以不会重新采样（否则重试会注入不同的联想）。
+
+**注入的可观测性**：`injections` 端点记录「哪一轮注入了什么」（含文本、messageId、条数、
+被跳过的条数）。这是为了让"注入是否真的生效"能在**一次真实发送后立刻确认**，
+而不是只能靠读代码相信。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
@@ -484,3 +523,6 @@ mergedNode.key = conversationContextKey(kind, id) = `${kind.length}:${kind}${id}
 | 2026-09-27 | 布局朝向经主人批复修正：规格 §4 由「左图右聊」改为「**中聊右图**」，并同步进 `docs/01-产品与技术规格.md` §4.1 | 主人当面批复（本会话） |
 | 2026-09-27 | **卡 1 收口**：新增 §2.6 真浏览器运行期实测（D1-1 / D1-2 / D1-4 硬证据）；探针表 P1、P5 升为「运行期实测通过」；记录三个运行期踩坑（宿主行须启用、客户端 bundle 禁 export、inject 服务名写错会让整个 Web UI 打不开） | `scripts/verify-session.ps1` 10/10 等五套脚本；真浏览器控制台洁净 |
 | 2026-09-27 | **卡 2 收口**：新增 §3.9（插件包解析与自包含约束）与 §3.10（Host↔Client 数据通道选型）。实测打通 overlay 权威存储：领域 `freethought_map` 落盘、`load/save` 走通、**过期 save 返回 conflict 且权威未被覆盖**。又踩两个坑：单元名不允许连字符（`freethought-map` → `freethought_map`）；`remote` 与 `remote.<ns>` 未 inject 会抛并让整个 UI 打不开 → 改用直连传输 | `scripts/verify-session.ps1` 15/15；`C:\Users\Administrator\.dsh\storages\freethought_map.json` 实盘核对 |
+| 2026-09-27 | **卡 3 收口**：新增 §3.11（落链所需的精确事件形状）与 §3.12（落链实现要点）。27 条合成事件断言覆盖 D3-1~D3-5 与幽灵清理/摘除/派生标题不落盘。发现 `ctx.on` 是 scope-owned，**不需要**手写 `ctx.off`（全树 130+ 处 `ctx.on`，0 处 `ctx.off`） | `scripts/verify-project.mjs` 27/27 |
+| 2026-09-27 | **卡 4 收口**：新增 §3.13。图→气泡单向 + 焦点选中分离；气泡→图**明确不做**（唯一途径是影子替换，违反红线）。新增"两份源码函数体逐字比对"的防漂移断言，使代码复制安全 | `scripts/verify-locate.mjs` 25/25 |
+| 2026-09-27 | **卡 5 收口**：新增 §3.14。粉线 + 发送快照注入（`agent/pre-step`）全部接线完成，29 条纯函数断言。**运行期抓到真 bug**：加新端点时删掉了 `events` 方法体，报 `Remote marker has no prototype method` —— 而"marker 与契约集合一致"那条断言是绿的。已补断言：逐个确认 marker 里每个方法在类上真有方法体 | `scripts/verify-links.mjs` 29/29；`verify-host` 34/34 |
