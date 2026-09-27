@@ -15,6 +15,7 @@
  */
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { createPanelOpener } from './cdp-panel.mjs'
 
 const [, , wsUrl, origin, token, wsModuleDir, waitSecArg] = process.argv
 const WAIT_MS = Number(waitSecArg || 25) * 1000
@@ -612,32 +613,17 @@ console.log(`会话内渲染验证：${results.filter(([s]) => s === 'PASS').len
 // 复用这里已经跑通的「进会话 + 打开插件 tab」逻辑，避免另写一套点击逻辑
 // （先前单独写的诊断脚本点不进会话画面，面板根本没挂载）。
 if (process.env.FTM_PANEL_DIAG === '1') {
-  // 先确保面板真的打开：右列 tab 条里找我们的 tab 并点它。
-  // （宿主只在「第一次」自动打开；测试用的临时 profile 每次都相当于第一次，
-  //  但会话切换/右列收起之后不一定还开着 —— 不点开就看不到链行。）
-  const rootNow = await evaluate(`!!document.querySelector('[data-freethought-map-root]')`)
-  if (!rootNow) {
-    console.log('\n=== 诊断：先打开插件 tab ===')
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const opened = await evaluate(`(() => {
-        const vis = (e) => e.offsetParent !== null;
-        // 1) dockkit tab 条里按文本找
-        const tabs = [...document.querySelectorAll('[data-dockkit-tab], [role="tab"], button')].filter(vis);
-        const mine = tabs.find(t => /FreeThought|思路|ftm/i.test((t.innerText || '') + ' ' + (t.getAttribute('aria-label') || '') + ' ' + (t.title || '')));
-        if (mine) { mine.click(); return { via: 'tab-text', label: (mine.innerText || mine.getAttribute('aria-label') || '').trim().slice(0, 30) }; }
-        return { via: 'none', candidates: tabs.map(t => (t.innerText || t.getAttribute('aria-label') || '').trim().slice(0, 18)).filter(Boolean).slice(0, 14) };
-      })()`)
-      if (attempt === 0) console.log('  ' + JSON.stringify(opened))
-      await new Promise((res) => setTimeout(res, 1800))
-      const got = await evaluate(`!!document.querySelector('[data-freethought-map-root]')`)
-      if (got) {
-        console.log('  面板已打开（第 ' + (attempt + 1) + ' 次尝试）')
-        break
-      }
-    }
-  } else {
-    console.log('\n=== 诊断：面板本来就开着 ===')
-  }
+  // 用封好的助手可靠打开面板（踩过的两个坑都封在里面了，见 scripts/cdp-panel.mjs）
+  const opener = createPanelOpener(evaluate, send)
+  console.log('\n=== 诊断：确保插件面板挂载 ===')
+  const opened = await opener.ensurePanelOpen({
+    sessionId: process.env.FTM_SESSION_ID || '',
+    timeoutMs: 20000,
+  })
+  for (const n of opened.notes) console.log('  ' + n)
+  console.log('  结果: ' + JSON.stringify({ ok: opened.ok, how: opened.how, tabId: opened.tabId }))
+  const tab = await opener.currentTab()
+  console.log('  dockkit tabs: ' + JSON.stringify(tab.tabs))
 
   console.log('\n=== 诊断：面板链行 ===')
   const rows = await evaluate(`(() => {
