@@ -440,6 +440,11 @@ if (labels.length === 0) {
   /**
    * 去掉空白与**所有**注释行后比对，避免只因缩进/换行/注释不同就误报。
    * 注意要把 `}` 后面的行内注释也剥掉（`continue // 说明` 这种），否则会被当成差异。
+   *
+   * 另外容忍**一种**替换：overlay 里的操作类型是常量（`OP_ANNOTATE`），
+   * 而客户端没有那个常量，副本里写的是字面量 `'annotate'`。
+   * 这是刻意的（客户端抽不出 `const` 的声明），所以比对前把常量替换成字面量。
+   * 除这一种之外，任何差异都必须报出来。
    */
   function normalize(body) {
     return body
@@ -447,13 +452,28 @@ if (labels.length === 0) {
       .map((l) => l.replace(/\s*\/\/.*$/, '').replace(/\s+/g, ' ').trim())
       .filter((l) => l && !l.startsWith('*') && !l.startsWith('/*'))
       .join(' ')
+      .replace(/\bOP_CREATE\b/g, "'create'")
+      .replace(/\bOP_SET_PARENT\b/g, "'set-parent'")
+      .replace(/\bOP_DELETE\b/g, "'delete'")
+      .replace(/\bOP_ANNOTATE\b/g, "'annotate'")
+      .replace(/\bOP_GEOMETRY\b/g, "'geometry'")
+      .replace(/\bOP_LINK_ADD\b/g, "'link-add'")
+      .replace(/\bOP_LINK_REMOVE\b/g, "'link-remove'")
   }
 
-  const shared = ['bubbleSelectorCandidates', 'locateBubble', 'buildChainView']
+  // 每个副本的**来源文件**要写清 —— 早先这条只认 locate.js，
+  // 所以 undo.js 的副本（opAnnotate，画布阶段 1）就没法纳进来。
+  const undoSource = readFileSync(join(root, 'src', 'overlay', 'undo.js'), 'utf8')
+  const shared = [
+    ['bubbleSelectorCandidates', locateSource],
+    ['locateBubble', locateSource],
+    ['buildChainView', locateSource],
+    ['opAnnotate', undoSource],
+  ]
   let drifted = []
   let compared = 0
-  for (const fn of shared) {
-    const a = extractFunction(locateSource, fn)
+  for (const [fn, src] of shared) {
+    const a = extractFunction(src, fn)
     const b = extractFunction(clientSource, fn)
     if (a === null || b === null) {
       drifted.push(fn + '(抽不出函数体)')
@@ -463,7 +483,7 @@ if (labels.length === 0) {
     if (normalize(a) !== normalize(b)) drifted.push(fn)
   }
   if (drifted.length === 0) {
-    ok(`客户端副本与 overlay 源文件逐字一致（${compared} 个函数：${shared.join(', ')}）`)
+    ok(`客户端副本与 overlay 源文件逐字一致（${compared} 个函数：${shared.map(([f]) => f).join(', ')}）`)
   } else {
     bad('副本已漂移，必须同步修改两处：' + drifted.join(', '))
   }
@@ -768,6 +788,73 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
       ok('标题持久化区分「首建用 put」与「更新用 update」（`update` 不创建记录，首建会抛 missing-key）')
     } else {
       bad('标题持久化没有区分首建/更新 —— 首次写入会因 `update` 找不到记录而失败')
+    }
+  }
+
+  // ── 行内编辑注解的接线（画布计划 §8 的最小第一步）─────────────────────────
+  //
+  // 这一步的风险不在纯函数（`opAnnotate` 有 40 条断言），而在**接线**：
+  // 编辑器有没有真的调用 `saveAuthority`、`""` 会不会被当成"删除注解"、
+  // 按 Enter 会不会重复提交。这些只有源码断言 + 真浏览器能守。
+  {
+    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
+    if (/kind: 'annotate', nodeId: row\.id, title: editing\.draft/.test(clientSource)) {
+      ok("行内编辑提交时带 `annotate` 意图（撞 409 时能重放，而不是丢掉用户的编辑）")
+    } else {
+      bad('行内编辑没有带 annotate 意图 —— 撞上投影落链就会静默丢掉这次编辑')
+    }
+    if (/intent\.kind === 'focus' \|\| intent\.kind === 'annotate'/.test(clientSource)) {
+      ok('409 重放认两种意图（focus 与 annotate）')
+    } else {
+      bad('409 重放只认 focus —— 注解编辑会被丢弃')
+    }
+    if (/opAnnotate\(payload\.doc, intent\.nodeId, intent\.title\)/.test(clientSource)) {
+      ok('注解重放是**在权威 doc 上重算**（不是把旧快照拍上去 —— 那会抹掉刚落链的节点）')
+    } else {
+      bad('注解重放没有在权威 doc 上重算')
+    }
+    if (/data-ftm-annotate-input/.test(clientSource)) {
+      ok('编辑框有稳定标记 `data-ftm-annotate-input`（真浏览器能据此定位并驱动）')
+    } else {
+      bad('编辑框没有稳定标记 —— 真机验收没法定位它')
+    }
+    if (/annotateDone/.test(clientSource)) {
+      ok('有防重复提交的同步闸门（Enter 提交后卸载会触发 onBlur，不加闸会保存两次）')
+    } else {
+      bad('没有防重复提交 —— Enter 提交后会因为 onBlur 再保存一次')
+    }
+    // 空串必须保留为**合法值**：提交路径里不得把 '' 转成 delete/null
+    if (/editing\.draft/.test(clientSource) && !/draft === '' *\? *null/.test(clientSource)) {
+      ok('空串原样提交（规格 §10.1：`""` 是"主动清空"，不是"删除注解"）')
+    } else {
+      bad('空串被转成了删除语义 —— 违反规格 §10.1 的三态')
+    }
+    // 编辑框里放的必须是**注解**而不是显示名（否则会把派生标题偷偷固化成注解）
+    // 编辑初值取注解本身（不是显示名）—— 否则会把派生标题偷偷固化成注解
+    if (/annotationDraftOf\(authority\.doc/.test(clientSource)) {
+      ok('编辑初值取注解本身（不是显示名）—— 不会把派生标题偷偷固化成注解')
+    } else {
+      bad('编辑初值来自显示名 —— 保存后等于凭空写了一条注解')
+    }
+
+    // ⚠️ 双击检测**必须**基于 onClick，不能只靠 onDblClick。
+    // 真机实测（2026-09-27）：DSH 的 Web shell 里 React 的合成 `onDblClick` **不响应**
+    // （原生 dblclick 确实冒泡到了 `#root`，而同一元素的 `onClick` 完全正常）。
+    // 只留 onDblClick 的话，真机上双击就是没反应 —— 而离线断言全绿也看不出来。
+    if (/DBLCLICK_MS/.test(clientSource) && /isDoubleClick\(row\)/.test(clientSource)) {
+      ok('双击用 `onClick` 自己判两次（不依赖合成 onDblClick —— 真机上它不响应）')
+    } else {
+      bad('双击只依赖 onDblClick —— 真机实测它不响应，双击会没反应')
+    }
+    if (/onRowClick[\s\S]{0,160}isDoubleClick\(row\)[\s\S]{0,120}beginAnnotate\(row\)/.test(clientSource)) {
+      ok('双击命中时**不再**顺带设一次焦点（否则等于双击同时改了两件事）')
+    } else {
+      bad('双击没有先于设焦点判断 —— 会同时改焦点和进编辑')
+    }
+    if (/e\.key === 'F2'/.test(clientSource)) {
+      ok('有键盘入口 `F2`（给不用鼠标的用户一条路，真机实测可用）')
+    } else {
+      bad('没有键盘入口进编辑态')
     }
   }
 

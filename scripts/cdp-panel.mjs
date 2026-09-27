@@ -73,8 +73,26 @@ export function createPanelOpener(evaluate, send) {
     return { ok: false, tabs: await tabCount() }
   }
 
+  /** 面板当前挂载在哪个会话（读面板正文里的 session-… 串）。 */
+  async function panelSession() {
+    return await evaluate(`(() => {
+      const root = document.querySelector('[data-freethought-map-root]');
+      if (!root) return null;
+      const m = (root.innerText || '').match(/session-[0-9a-f-]{8,}/i);
+      return m ? m[0] : null;
+    })()`)
+  }
+
   /**
-   * 确保插件面板挂载。步骤：进会话 → 展开右列 → （必要时）清标记刷新重来。
+   * 确保插件面板挂载，**并且挂在指定的会话上**。
+   *
+   * ⚠️ 「已经挂载」不等于「挂对了会话」：
+   * 插件面板是**按会话**挂载的，而 `ensurePanelOpen` 早先只要看到根节点就直接返回
+   * ⇒ 上一次验收留下的会话会被当成"已经准备好"，于是整轮验收在**错的会话**上跑，
+   * 报出一堆莫名其妙的失败（2026-09-27 实际踩到：验注解时打开的是测试会话，
+   * 面板里只有 1 行，三条断言全红）。
+   *
+   * 所以这里必须先比对会话；不一致就切过去（切会话会重挂面板）。
    *
    * @param {{sessionId?: string, timeoutMs?: number, forceAutopen?: boolean}} [opts]
    * @returns {Promise<{ok: boolean, how?: string, tabId?: string|null, notes: string[]}>}
@@ -82,12 +100,28 @@ export function createPanelOpener(evaluate, send) {
   async function ensurePanelOpen(opts = {}) {
     const notes = []
     const timeoutMs = opts.timeoutMs || 20000
+    const want = opts.sessionId || ''
 
-    // 已经开着就直接返回
-    if ((await rootCount()) > 0) return { ok: true, how: 'already-mounted', notes }
+    // 已经开着**且会话对**才直接返回
+    if ((await rootCount()) > 0) {
+      const cur = await panelSession()
+      if (!want || cur === want) return { ok: true, how: 'already-mounted', notes }
+      notes.push('面板挂在 ' + cur + '，要的是 ' + want + ' → 切会话')
+      const s0 = await openSession(want)
+      notes.push('切会话=' + JSON.stringify(s0))
+      // 切会话会重挂，等它回来
+      for (let i = 0; i < 12; i += 1) {
+        await sleep(1000)
+        if ((await rootCount()) > 0 && (await panelSession()) === want) {
+          const info = await currentTab()
+          return { ok: true, how: 'switched-session', tabId: info.tabId, notes }
+        }
+      }
+      notes.push('切会话后面板没回来，继续按"未挂载"流程走')
+    }
 
     // 1) 进会话
-    const s = await openSession(opts.sessionId)
+    const s = await openSession(want)
     notes.push('openSession=' + JSON.stringify(s))
     if (!s.ok) return { ok: false, notes }
 
@@ -99,7 +133,10 @@ export function createPanelOpener(evaluate, send) {
     // 3) 等一会儿（自动打开逻辑在 apply 时轮询 mounted，间隔 500ms）
     for (let i = 0; i < Math.ceil(timeoutMs / 1500); i += 1) {
       await sleep(1500)
-      if ((await rootCount()) > 0) return { ok: true, how: 'autopened', notes }
+      if ((await rootCount()) > 0) {
+        const info = await currentTab()
+        return { ok: true, how: 'autopened', tabId: info.tabId, notes }
+      }
     }
 
     // 4) 还没出来 → 多半是 autopen 标记已落地（设计上会永久跳过）。清掉刷新重来。
@@ -121,7 +158,7 @@ export function createPanelOpener(evaluate, send) {
     await send('Page.reload', { ignoreCache: true })
     await sleep(12000)
 
-    const s2 = await openSession(opts.sessionId)
+    const s2 = await openSession(want)
     notes.push('reload 后 openSession=' + JSON.stringify(s2))
     const e2 = await expandRightRail()
     notes.push('reload 后 expandRightRail=' + JSON.stringify(e2))
@@ -161,5 +198,5 @@ export function createPanelOpener(evaluate, send) {
     })()`)
   }
 
-  return { openSession, expandRightRail, ensurePanelOpen, currentTab, focusOurTab, tabCount, rootCount, bubbles }
+  return { openSession, expandRightRail, ensurePanelOpen, currentTab, focusOurTab, panelSession, tabCount, rootCount, bubbles }
 }

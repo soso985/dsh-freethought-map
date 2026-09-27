@@ -152,6 +152,51 @@ function collectWindowEvents(_ctx, _sessionId) {
   return null
 }
 
+/**
+ * 写注解（画布计划的阶段 1 第 1 项：行内编辑注解）。
+ *
+ * ⚠️ 这是 `src/overlay/undo.js` 里 `opAnnotate` 的**逐字副本**。
+ * 为什么复制而不是 import：客户端 bundle 是单文件自包含的惰性 CJS 注册，
+ * **不能同步 require 另一个相对模块**（官方 README 明令）。
+ * 防漂移：`scripts/verify-host.mjs` 会把两份源码里的函数体抽出来逐字比对，
+ * 不一致直接 FAIL —— 所以复制是安全的，它不会悄悄分叉。
+ *
+ * 语义（规格 §10.1 三态）：
+ *   · `title === null` → **删掉字段**（回到"没注解"，显示派生标题）
+ *   · `title === ''`   → **合法值**，表示"用户主动清空"，显示空**且不回退**派生标题
+ *   · 非空             → 显示注解
+ * 返回值带上 `op`（含 `before` 与 `hadBefore`），撤销才能区分
+ * 「本来是空串」与「本来没这个字段」。
+ */
+function opAnnotate(doc, id, title) {
+  const node = doc.nodes[id]
+  if (!node) return { ok: false, reason: 'missing', doc }
+  if (title !== null && typeof title !== 'string') return { ok: false, reason: 'bad-title', doc }
+  const hadBefore = Object.prototype.hasOwnProperty.call(node, 'title')
+  const next = { ...node }
+  if (title === null) delete next.title
+  else next.title = title
+  return {
+    ok: true,
+    doc: { ...doc, nodes: { ...doc.nodes, [id]: next } },
+    // before/hadBefore 一起带上：撤销才能区分「本来是空串」与「本来没这个字段」
+    op: { type: 'annotate', id, title, before: hadBefore ? node.title : undefined, hadBefore },
+  }
+}
+
+/**
+ * 行内编辑器的**初值**：注解本身，不是显示名。
+ *
+ * 为什么不用显示名：那可能是派生标题（原文）。把原文塞进编辑框会让用户
+ * 一提交就把"派生"变成"注解"，等于**偷偷固化了一份原文** —— 那不是用户写的。
+ * 所以没注解就留空。
+ */
+function annotationDraftOf(doc, id) {
+  const node = doc && doc.nodes ? doc.nodes[id] : null
+  if (!node) return ''
+  return node.title === undefined || node.title === null ? '' : String(node.title)
+}
+
 function createPlugin(React) {
   const h = React.createElement
   const { useCallback, useEffect, useRef, useState } = React
@@ -386,6 +431,17 @@ function createPlugin(React) {
   padding: 0 4px;
 }
 [${ROOT_ATTR}] .ftm-chain-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[${ROOT_ATTR}] .ftm-chain-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  padding: 1px 4px;
+  border: 1px solid var(--dsw-alias-brand, rgb(64, 128, 255));
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-1, rgba(255, 255, 255, 0.06));
+  color: inherit;
+  outline: none;
+}
 [${ROOT_ATTR}] .ftm-chain-row.is-focus .ftm-chain-title { font-weight: 600; }
 [${ROOT_ATTR}] .ftm-chain-jump {
   flex: 0 0 auto;
@@ -509,6 +565,21 @@ function createPlugin(React) {
       const inflight = useRef(0)
       /** 本面板内的高亮（画布还没做，卡 7 才接真画布） */
       const [highlightId, setHighlightId] = useState(null)
+      /**
+       * 行内编辑注解（画布计划 §8 的最小第一步）。
+       *
+       * 一次只编辑一行：`{ nodeId, draft }`；`null` = 没有在编辑。
+       * `draft` 的初值取**注解本身**（不是显示名）—— 见 `annotationDraftOf`。
+       */
+      const [annotating, setAnnotating] = useState(null)
+      /**
+       * 「本次编辑已经结束了」的同步闸门。
+       *
+       * 为什么必须是 ref 而不是 state：按 Enter 提交后输入框会卸载，
+       * **卸载会触发 onBlur**，而那一刻 `annotating` 的闭包还停在旧值 ——
+       * 没有这道闸就会保存两次。ref 的写入是同步的，同一轮事件里立刻可见。
+       */
+      const annotateDone = useRef(false)
       /** 「跳到气泡」的可见反馈（找不到 / 命中多个 都要说出来，不静默） */
       const [jumpNotice, setJumpNotice] = useState(null)
       /** 卡 8：帮助面板开合 */
@@ -791,8 +862,9 @@ function createPlugin(React) {
        * 「投影刚落链、面板还是旧 rev」会变成**常态**，409 会经常发生。
        * 只重载的话，用户点节点设焦点这件事会在有投影落地时静默失败。
        *
-       * `intent` 描述"本次想改什么"，目前只有 focus 一种（面板点击）。形状：
+       * `intent` 描述"本次想改什么"，目前两种（面板点击设焦点、行内编辑写注解）。形状：
        *   `{ kind: 'focus', nodeId: string }`
+       *   `{ kind: 'annotate', nodeId: string, title: string }`
        * 传 null 表示"整份 doc 都是我算好的"（没有可重放的单一意图），此时只重载并提示。
        *
        * @param {object} nextDoc 要提交的 doc
@@ -824,7 +896,13 @@ function createPlugin(React) {
               }
               if (payload.status === 'conflict') {
                 // 权威变了（多半是投影刚落链）。先把权威换进本地 —— 这一步保证不覆盖。
-                const canRetry = overrideRev === undefined && intent && intent.kind === 'focus'
+                //
+                // 能重放的意图都要重放：只重载的话用户那次操作就**静默丢了**。
+                // 目前两种：设焦点（面板点击）、写注解（行内编辑）。
+                const canRetry =
+                  overrideRev === undefined &&
+                  intent &&
+                  (intent.kind === 'focus' || intent.kind === 'annotate')
                 setAuthority({
                   sessionId,
                   doc: payload.doc,
@@ -835,9 +913,18 @@ function createPlugin(React) {
                     : '宿主数据已更新（版本 ' + String(payload.rev) + '），本地已重载，未覆盖。',
                 })
                 if (canRetry) {
-                  const rebased = { ...payload.doc, focusId: intent.nodeId }
+                  // 重放 = 把**同一次意图**重新施加到权威 doc 上。
+                  // 注解用 `opAnnotate` 重算（而不是把算好的整份 doc 拍上去）——
+                  // 这样权威 doc 上刚落链的节点不会被我们的旧快照抹掉。
+                  let rebased = null
+                  if (intent.kind === 'focus') {
+                    rebased = { ...payload.doc, focusId: intent.nodeId }
+                  } else {
+                    const r2 = opAnnotate(payload.doc, intent.nodeId, intent.title)
+                    rebased = r2.ok ? r2.doc : null
+                  }
                   const fn = retryRef.current
-                  if (fn) fn(payload.rev, rebased, intent)
+                  if (fn && rebased) fn(payload.rev, rebased, intent)
                 }
                 return
               }
@@ -966,6 +1053,11 @@ function createPlugin(React) {
       const chainRows = buildChainView(authority.doc || { nodes: {} }, { derivedTitles })
 
       const onRowClick = (row) => {
+        // 双击 → 进编辑（先判，避免第二次点击又去设一次焦点）
+        if (isDoubleClick(row)) {
+          beginAnnotate(row)
+          return
+        }
         setHighlightId(row.id)
         // 焦点与选中分离：这里只动本面板的高亮 + 把焦点写回权威。
         //
@@ -974,6 +1066,68 @@ function createPlugin(React) {
         const doc = authority.doc
         if (!doc || doc.focusId === row.id) return
         saveAuthority({ ...doc, focusId: row.id }, { kind: 'focus', nodeId: row.id })
+      }
+
+      /**
+       * 行内编辑注解（画布计划 §8 的最小第一步）。
+       *
+       * 交互：**双击**行 → 变成输入框；`Enter` 提交，`Esc` 取消，失焦提交；
+       * 键盘 `F2` 也能进入编辑（表格类界面的通行约定）。
+       *
+       * ⚠️ 「双击」为什么用 `onClick` 自己判两次、而不是直接吃 `onDblClick`：
+       * 真机实测（2026-09-27）在 DSH 的 Web shell 里，**React 的合成 `onDblClick`
+       * 不响应** —— 原生 `dblclick` 事件确实冒泡到了 React 根容器 `#root`
+       * （`getEventListeners(#root).dblclick` 有、我自己挂的捕获监听也收到），
+       * 而同一个元素的 `onClick` **完全正常**。直接调 `props.onDblClick()` 也是好的，
+       * 所以问题在派发那一层，不在我们的代码。
+       *
+       * 于是：**用已经验证可用的 `onClick` 判两次快速点击**（450ms 内同一行两次），
+       * 并保留 `onDblClick` 与 `F2` 作为附加入口。三者在用户手里是同一种手感，
+       * 但只有前两条是实测可靠的。
+       */
+      const DBLCLICK_MS = 450
+      const lastClickRef = useRef({ id: null, at: 0 })
+
+      const beginAnnotate = (row) => {
+        annotateDone.current = false
+        setAnnotating({ nodeId: row.id, draft: annotationDraftOf(authority.doc, row.id) })
+      }
+
+      /** 双击检测：同一行在 `DBLCLICK_MS` 内被点第二次 → 进入编辑。 */
+      const isDoubleClick = (row) => {
+        const now = Date.now()
+        const prev = lastClickRef.current
+        const hit = prev.id === row.id && now - prev.at <= DBLCLICK_MS
+        lastClickRef.current = { id: row.id, at: now }
+        return hit
+      }
+
+      const commitAnnotate = (row) => {
+        const editing = annotating
+        if (!editing || editing.nodeId !== row.id) return
+        // ⚠️ 防重复提交：按 Enter 提交后输入框会卸载，**卸载会触发 onBlur**，
+        // 而此刻 `annotating` 的闭包还是旧值 ⇒ 不加这道闸就会保存两次
+        // （多一次落盘，还可能无谓地撞一次 409）。用 ref 而不是 state：
+        // ref 是同步的，同一轮事件处理里改了立刻生效。
+        if (annotateDone.current) return
+        annotateDone.current = true
+        setAnnotating(null)
+        const doc = authority.doc
+        if (!doc) return
+        const r = opAnnotate(doc, row.id, editing.draft)
+        if (!r.ok) {
+          setAuthority((s) => ({ ...s, notice: '写注解失败：' + (r.reason || '未知原因') }))
+          return
+        }
+        // 初值就取自注解本身，所以"没改动"时不必提交（省一次落盘，也就不会无谓地撞 409）
+        if (annotationDraftOf(doc, row.id) === editing.draft) return
+        // 第二个参数是本次意图：撞 409 时按权威 doc 重算这次注解，而不是丢掉用户的编辑
+        saveAuthority(r.doc, { kind: 'annotate', nodeId: row.id, title: editing.draft })
+      }
+
+      const cancelAnnotate = () => {
+        annotateDone.current = true // 取消也算"这次编辑结束了"，别让随后的 blur 再提交
+        setAnnotating(null)
       }
 
       const onJumpToBubble = (row) => {
@@ -1011,19 +1165,69 @@ function createPlugin(React) {
                   style: { paddingLeft: 6 + row.depth * 12 },
                 },
                 h(
-                  'button',
+                  // ⚠️ 用 `div` 而不是 `button`：编辑态里要放 `<input>`，
+                  // 而 `<input>` 嵌在 `<button>` 里是**非法 HTML** ——
+                  // 浏览器会重排 DOM，React 的 autoFocus / blur 就会错乱。
+                  // 所以这里始终是 div + 手写 role/tabIndex/键盘处理；
+                  // `.ftm-chain-main` 的样式本来就把它当成一个可点的行来处理。
+                  'div',
                   {
                     className: 'ftm-chain-main',
-                    title: '选中并把焦点移到这里（下一句默认挂到它下面）',
+                    role: 'button',
+                    tabIndex: 0,
+                    title: annotating && annotating.nodeId === row.id
+                      ? '编辑注解中（Enter 提交，Esc 取消）'
+                      : '选中并把焦点移到这里（下一句默认挂到它下面）；双击写注解（或按 F2）',
                     onClick: () => onRowClick(row),
+                    // 附加路径：实测在 DSH 的 shell 里这个合成事件不响应（见 beginAnnotate 的注释），
+                    // 留着不碍事 —— 万一某个环境里它能用，用户就多一条路。
+                    onDblClick: () => beginAnnotate(row),
+                    onKeyDown: (e) => {
+                      if (annotating && annotating.nodeId === row.id) return
+                      e.stopPropagation()
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        onRowClick(row)
+                      } else if (e.key === 'F2') {
+                        // F2 = 重命名，是表格类界面的通行约定；给键盘用户一条不用双击的路
+                        e.preventDefault()
+                        beginAnnotate(row)
+                      }
+                    },
                   },
                   h('span', { className: 'ftm-chain-badge' }, row.kind === 'turn' ? '回合' : '手建'),
-                  h(
-                    'span',
-                    { className: 'ftm-chain-title' },
-                    // 注解是空串时**显示空**，用一个占位符表明"用户主动清空了"
-                    row.title === '' ? (row.hasAnnotation ? '（已清空）' : '（无标题）') : row.title,
-                  ),
+                  annotating && annotating.nodeId === row.id
+                    ? h('input', {
+                        className: 'ftm-chain-input',
+                        'data-ftm-annotate-input': row.id,
+                        value: annotating.draft,
+                        placeholder: '写注解（留空＝主动清空，不再显示原文）',
+                        autoFocus: true,
+                        onClick: (e) => e.stopPropagation(),
+                        onDblClick: (e) => e.stopPropagation(),
+                        onInput: (e) => setAnnotating((s) => (s ? { ...s, draft: e.target.value } : s)),
+                        onKeyDown: (e) => {
+                          // ⚠️ 必须在这里停掉冒泡：面板根节点上挂着 Ctrl+Z 等快捷键，
+                          // 而且官方输入框也监听键盘 —— 编辑注解时按键只该归这个输入框。
+                          e.stopPropagation()
+                          if (e.key === 'Enter') {
+                            e.preventDefault()
+                            commitAnnotate(row)
+                          } else if (e.key === 'Escape') {
+                            e.preventDefault()
+                            cancelAnnotate()
+                          }
+                        },
+                        // 失焦提交：点别处就落盘，不用用户记得按回车。
+                        // Esc 取消时也会触发 blur —— 那时 `annotating` 已清空，commit 里会提前返回。
+                        onBlur: () => commitAnnotate(row),
+                      })
+                    : h(
+                        'span',
+                        { className: 'ftm-chain-title' },
+                        // 注解是空串时**显示空**，用一个占位符表明"用户主动清空了"
+                        row.title === '' ? (row.hasAnnotation ? '（已清空）' : '（无标题）') : row.title,
+                      ),
                 ),
                 row.sourceRef
                   ? h(
