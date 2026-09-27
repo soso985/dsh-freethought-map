@@ -669,6 +669,122 @@ return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
 产品代码（`src/`）一行未改。四个临时诊断脚本（会话结构侦察、发送诊断、通用探针运行器、
 自动发送器）用完已删。
 
+### 3.19 注入链路真机验成 + 三个连带发现（2026-09-27）
+
+§3.18 记的是"没验成"。**后来验成了** —— 方式是：不再用 CDP 自动打字（Lexical 上做不对），
+改成「人在界面上手打一句」，用 `src/host/hook-probe.js` 把每次 `agent/pre-step` 调用
+追加写进 `%TEMP%\ftm-pre-step-probe.jsonl`。
+
+**验成的证据**（一次真实发送的探针记录）：
+
+```
+turn/step       : 4 / 1
+决策            : enter → enter
+**改了 messages**: true          ← 真的插进去了
+消息条数        : before=1  after=2
+outcome         : injected
+注入摘要        :
+    messageId   : 50623f1f-b941-4e4c-b828-5e6180d78854
+    焦点节点    : T1l2gtel-5a756613-e6a
+    插入位置    : messages[1]
+    文本预览    : "[用户图数据]\n当前焦点：《（未命名）》"
+耗时 / 错误     : 5ms / null
+```
+
+⇒ 卡 1 的 P4 与卡 5 的注入**在真机上成立**。§3.18 那条疑问关闭。
+
+#### 发现 1：派生标题索引键错配（已修，`0a4e7d9`）
+
+注入文案里节点名是「（未命名）」，本该是原文。根因：
+
+```
+SettlementLog 按 **eventId** 建键：  derived["90f4863c-…"] = "456"
+displayNameOf 按 **node.id** 查表：  derived["Tc8h8lh-90f4863c-02b"] → 查不到
+```
+
+而**所有**显示名消费方都按 `node.id` 查（`links.js` 的 `displayNameOf`、
+`tools.js` 的 `nameOf`、客户端 `buildChainView`）。有注解的节点没事（走 `node.title`），
+所以这个 bug 只在"投影节点 + 注入/工具/链显示"这条路上暴露。
+
+修法：`overlay/links.js` 新增 `buildDerivedTitleIndex(doc, entries)` 做键换算
+（桥梁是节点自己的 `sourceRef.eventId`，真机核对过与事件日志的键是同一个值）。
+修后真机复验：同一路径、只换焦点节点，`（未命名）` → **`《000》`**。
+变异测试：把实现改回 `eventId→title`，2 条断言立刻红。
+
+#### 发现 2：`Session` 的同步读接口**全部废弃**（关键约束）
+
+原打算「宿主重启后从会话补读原文」，实测被否：
+
+| 接口 | 状态 |
+| --- | --- |
+| `session.snapshotEvents(from, to)` | `@deprecated` |
+| `session.eventAt(seq)` | `@deprecated` |
+| `session.ownEvents()` | `@deprecated` |
+
+注释原文：「Existing logic may remain unmigrated for now, but **new calls are prohibited**.」
+指向一份 Agent Note（`2026-09-09-deprecate-synchronous-session-event-reads.md`，
+不在 `app.asar` 里）。而 `SessionStore` 上**没有**替代的读面
+（`get`/`list` 只给会话对象；`registerMessageProjection`/`deriveMessages`/`requestContext`
+/`toolHistory` 都不返回原始事件）。
+
+⇒ **「事后读会话」这条路是关的。** 任何依赖它的方案都要放弃。
+
+#### 发现 3：派生标题原先只活在内存 ⇒ 宿主重启即全失效（已修，`f0dec45`）
+
+`SettlementLog` 是内存环形缓冲 ⇒ 宿主一重启，所有已有节点的标题全没了
+（注入退化「（未命名）」、面板退化「（无标题）」）。真机量化基线：
+
+```
+面板 15 行里只有 2 行有真实标题；eventsCount=2  eventsWithTitle=2  docNodes=15  refsInLog=2
+```
+
+只有**重启后新落**的那两个节点有标题，其余 13 个的 eventId **完全不在日志里**。
+
+**正解（不碰废弃 API）**：我们本来就实时收到每一个事件 ⇒ 在**投影那一刻**把派生标题
+记下来并持久化，重启后读回。落在**独立的表** `derived_titles`
+（`{ version, sessionId, titles: { [eventId]: 标题 } }`，只增不减 ⇒ 无 rev/并发问题）。
+
+规格合规：规格 §6.4 禁止的是「把派生标题写回 overlay 的 `title` 字段」（那是用户的注解字段），
+独立的表不违反那条。
+
+断言（`verify-host` 6 条）里有一条是**防止以后有人"顺手"接上废弃 API**：
+宿主源码里不得出现 `snapshotEvents(` / `.eventAt(` / `.ownEvents(`。
+
+#### 问题 B 的结论：**每个 step 都注入是必要的，不是重复**
+
+探针加了 `payloadInjected` / `decisionInjected`（这一步进来时已有的注入条数，
+按 `source.kind`/`source.form` 判定，**不按文本前缀** —— 前缀会被用户原文里的巧合字符串污染）。
+
+真机结果：
+
+```
+turn/step        : 7/1
+payloadMessages  : 1
+**payloadInjected**: 0      ← 这一步进来时 payload 里没有任何注入
+**decisionInjected**: 0
+```
+
+⇒ 每个 step 都是**全新的消息批次**，上一步的注入**不会**带进下一步。
+所以「每 turn 只注入一次」会让后续 step 失去图上下文；**保持每步注入是对的**。
+这条结论与探针断言一并保留（`verify-host` 有两条断言盯着这两格必须存在）。
+
+### 3.20 派生标题的两个来源（终态）
+
+`derivedTitleIndex(sessionId, doc)` 按优先级合并两个来源：
+
+| 优先级 | 来源 | 生命周期 | 覆盖范围 |
+| --- | --- | --- | --- |
+| 1 | `derived_titles` 表（投影时写入） | **持久**，跨重启 | 本插件见过并投影过的所有结算 |
+| 2 | `SettlementLog`（内存） | 进程内 | 本进程内见过的结算 |
+
+因为 `derivedTitleIndex` 是**同步**函数（被 `agent/pre-step` 同步调用），
+所以持久化那一侧要先经 `loadTitlesIntoCache` 异步灌进内存缓存。
+三条读取路径都做了预热：pre-step、只读工具、`exportDoc`。
+
+**已知局限**：插件启用**之前**就已经存在的旧节点没有标题（我们没见过那些事件），
+显示为面板的「（无标题）」/ 注入的「（未命名）」。
+这**不是**能修的 bug —— 读历史的路被废弃接口堵住了（见 §3.19 发现 2）。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
