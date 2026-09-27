@@ -1,0 +1,16 @@
+# dsh-freethought-map · DSH bundle patch
+#
+# 这一层在 profile 的组合树上插入本插件的宿主行（Host half）。
+# 客户端一半（画布 UI）由 package.json 的 `dsh.client` 声明，经 ./client 导出加载。
+#
+# 注意：patch 行按 id 覆盖；本文件只负责「插入」，不覆盖宿主的任何既有行。
+# 用户自己的偏好请写进 profile 的 cordis.patch.yml 或 $DSH_HOME/cordis.patch.yml，
+# 不要改这里（本文件随插件升级被替换）。
+#
+# dsh 0.1.7-rc.2 / commit c1275515b6b97551ec358c926c479ab750c687c0
+# 详见 docs/HOST.md
+
+- insert:
+    - id: freethought-map
+      name: 'dsh-freethought-map'
+      disabled: true
