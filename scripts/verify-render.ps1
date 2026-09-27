@@ -46,6 +46,10 @@ New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
 $debugPort = $Port + 1000
 Write-Host "CDP 端口: $debugPort   用户目录: $profileDir"
 
+# 记下启动前已有的浏览器 PID：结束时只关**本次新起的**，绝不碰用户正在用的浏览器
+# （headless 会派生多个子进程，所以按"新出现的 PID"整批收，而不是只关主进程）。
+$before = @(Get-Process msedge, chrome -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+
 $args = @(
   "--headless=new",
   "--disable-gpu",
@@ -88,10 +92,12 @@ try {
 }
 finally {
   if (-not $KeepOpen) {
-    try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
-    Start-Sleep -Milliseconds 400
-    Get-Process msedge, chrome -ErrorAction SilentlyContinue |
-      Where-Object { $_.Path -and $_.StartTime -gt (Get-Date).AddMinutes(-5) } |
-      ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { } }
+    # 只关本次新起的进程（含 headless 派生的子进程），按 PID 差集判定
+    $new = @(Get-Process msedge, chrome -ErrorAction SilentlyContinue |
+      Where-Object { $before -notcontains $_.Id })
+    foreach ($p in $new) { try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { } }
+    if ($new.Count -gt 0) { Write-Host "已清理本次测试的浏览器进程：$($new.Count) 个" }
+    Start-Sleep -Milliseconds 500
+    Remove-Item -Recurse -Force $profileDir -ErrorAction SilentlyContinue
   }
 }
