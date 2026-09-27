@@ -21,7 +21,16 @@
  *    这些形状都是从随包发布的**生成产物**与协议实现里逐字核对过的，不是猜的。
  */
 
-import { SAVE_CONFLICT, SAVE_OK, SAVE_REJECTED, applySave, createOverlay, validateOverlay } from '../overlay/index.js'
+import {
+  SAVE_CONFLICT,
+  SAVE_OK,
+  SAVE_REJECTED,
+  applySave,
+  canSetParent,
+  createOverlay,
+  validateOverlay,
+} from '../overlay/index.js'
+import { setCanSetParent } from '../overlay/undo.js'
 import {
   SettlementLog,
   applyProjection,
@@ -414,6 +423,10 @@ export const inject = ['storageDomain', 'sessions', 'tools']
  * @param {any} ctx
  */
 export function apply(ctx) {
+  // 先把防环实现接给 undo.js（客户端 bundle 不能 import 相对模块，所以用注入而非 import）。
+  // 两侧都必须接：宿主这一半，以及客户端的副本。
+  setCanSetParent(canSetParent)
+
   const spec = makeDomainSpec()
 
   /** 惰性打开的领域句柄：多次调用共享同一个 promise。 */

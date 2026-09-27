@@ -506,6 +506,54 @@ if (/injectionLog\.record\(/.test(hostSource)) {
   bad('注入没有可观测记录 —— 真实发送时无法确认是否生效')
 }
 
+// ── 9. 卡 7：撤销栈的接线（两边都必须把防环实现接上）──────────────────────────
+if (/setCanSetParent\(canSetParent\)/.test(hostSource)) {
+  ok('宿主已把 canSetParent 注入给 undo.js（防环只有一份实现）')
+} else {
+  bad('宿主没有注入 canSetParent —— undo.js 的改父校验会抛错（它刻意不重复实现防环）')
+}
+if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
+  ok('宿主 import 了 undo.js（用户操作与撤销栈在宿主侧可用）')
+} else {
+  bad('宿主没有 import undo.js')
+}
+{
+  const undoSource = readFileSync(join(root, 'src', 'overlay', 'undo.js'), 'utf8')
+  // 「undo 不新建节点」这条不变量：逆操作种类必须在白名单里
+  const kinds = [...undoSource.matchAll(/type: '([a-z-]+)',/g)].map((m) => m[1])
+  const illegal = [...new Set(kinds)].filter(
+    (k) =>
+      ![
+        'remove',
+        'restore-node',
+        'unremove',
+        're-delete',
+        'set-field',
+        'remove-link-added',
+        'link-restore',
+        'link-remove',
+        'unknown',
+        'create',
+        'delete',
+        'set-parent',
+        'annotate',
+        'geometry',
+        'link-add',
+      ].includes(k),
+  )
+  if (illegal.length === 0) {
+    ok('撤销相关的操作种类都在白名单里（没有"新建节点"型逆操作混进来）')
+  } else {
+    bad('出现预期外的操作种类：' + illegal.join(', '))
+  }
+  // 规格 §7 明令：禁止整份 doc 快照式编辑
+  if (/structuredClone\(doc\)|JSON\.parse\(JSON\.stringify\(doc\)\)/.test(undoSource)) {
+    bad('undo.js 里出现整份 doc 快照 —— 规格 §7 明令禁止（会把拖动期间的投影一起回滚）')
+  } else {
+    ok('undo.js 没有整份 doc 快照（符合规格 §7：只记被改字段的前后值）')
+  }
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 const fails = results.filter(([s]) => s === 'FAIL')
 const pad = Math.max(...results.map(([, m]) => m.length))
