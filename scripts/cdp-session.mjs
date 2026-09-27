@@ -660,17 +660,31 @@ if (process.env.FTM_PANEL_DIAG === '1') {
       });
       return await r.json();
     };
+    const rt = await post('titles', { sessionId: sid });
     const ev = await post('events', { sessionId: sid, sinceSeq: -1 });
     const ld = await post('load', { sessionId: sid });
     const entries = (ev.result && ev.result.ok && ev.result.value && ev.result.value.entries) || [];
+    const persisted = (rt.result && rt.result.ok && rt.result.value && rt.result.value.titles) || {};
     const doc = (ld.result && ld.result.ok && ld.result.value && ld.result.value.doc) || null;
+    // ⚠️ 派生标题有两个来源，必须分开报：
+    //   titles 端点是**持久化**的（跨宿主重启仍在）—— 面板真正该用的那一份
+    //   events 端点是**内存**结算日志（重启即空）—— 只是兜底
+    // 早先这里只报 events，于是"宿主持久化好了但客户端没读"这种 bug 在诊断里看不出来。
+    // （注意：这段在模板字符串里，注释里不能出现反引号。）
+    const persistedKeys = Object.keys(persisted);
     return {
       sessionId: sid,
+      persistedTitlesCount: persistedKeys.length,
+      persistedTitlesSample: persistedKeys.slice(0, 4).map(k => ({ eventId: k.slice(0, 12), title: persisted[k] })),
       eventsCount: entries.length,
       eventsWithTitle: entries.filter(e => e.title).length,
       eventsSample: entries.map(e => ({ eventId: String(e.eventId).slice(0, 12), title: e.title })),
       docNodes: doc ? Object.keys(doc.nodes).length : null,
       refsInLog: doc ? Object.values(doc.nodes).filter(n => n.sourceRef && entries.some(e => e.eventId === n.sourceRef.eventId)).length : null,
+      // doc 里有多少节点的 eventId 能在**持久化表**里找到（= 面板应当显示标题的行数）
+      refsInPersisted: doc
+        ? Object.values(doc.nodes).filter(n => n.sourceRef && persisted[n.sourceRef.eventId] !== undefined).length
+        : null,
     };
   })()`)
   console.log('  ' + JSON.stringify(probe, null, 2).split('\n').join('\n  '))

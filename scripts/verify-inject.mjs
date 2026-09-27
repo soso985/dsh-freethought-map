@@ -15,7 +15,7 @@
  */
 import assert from 'node:assert/strict'
 import { createOverlay } from '../src/overlay/index.js'
-import { addFreeLink, createPending, pendingAdd } from '../src/overlay/links.js'
+import { addFreeLink, buildDerivedTitleIndex, createPending, pendingAdd } from '../src/overlay/links.js'
 import {
   INJECT_DONE,
   INJECT_EMPTY,
@@ -342,6 +342,90 @@ test('消费：空快照不动 pending', () => {
   pending = pendingAdd(pending, 'link-1')
   assert.deepEqual(consumeInjectedSnapshot(pending, []).ids, ['link-1'])
   assert.deepEqual(consumeInjectedSnapshot(pending, undefined).ids, ['link-1'])
+})
+
+// ───── 派生标题的两个来源：持久化优先 ─────
+//
+// 背景（2026-09-27 真机）：派生标题原先只活在内存的 SettlementLog 里，
+// 宿主一重启就全失效，注入文案退化成「当前焦点：《（未命名）》」。
+// 修法是把标题在投影时持久化到独立的表，重启后读回。
+//
+// 这一组锁住「注入文案用的是持久化标题」这件事 ——
+// 因为它是产品初衷那一环：焦点摘要对模型有没有用，全看名字能不能读出来。
+
+test('持久化标题能经派生索引进入注入文案（重启后旧节点也有名字）', () => {
+  const doc = createOverlay('s-title')
+  doc.nodes['T-old'] = {
+    id: 'T-old',
+    kind: 'turn',
+    parentId: null,
+    position: { x: 0, y: 0 },
+    seq: 1,
+    sourceRef: { kind: 'user-message', eventId: 'evt-old' },
+  }
+  doc.focusId = 'T-old'
+  // 关键：**没有**内存日志（模拟宿主重启后日志为空），只有持久化标题表
+  const derived = buildDerivedTitleIndex(doc, [{ eventId: 'evt-old', title: '456' }])
+  const r = computeInjection({
+    decision: { kind: 'enter', messages: [{ id: 'u1', role: 'user' }] },
+    payload: { sessionId: 's-title', messages: [{ id: 'u1', role: 'user' }] },
+    doc,
+    pending: createPending(),
+    derivedTitles: derived,
+    snapshotStore: null,
+  })
+  assert.equal(r.status, INJECT_DONE)
+  assert.match(r.meta.text, /当前焦点：《456》/, '必须用持久化标题，而不是「（未命名）」')
+  assert.doesNotMatch(r.meta.text, /（未命名）/, '不得退化成占位符')
+})
+
+test('标题不可得的节点仍如实显示（未命名）—— 插件启用前的旧节点就是这个状态', () => {
+  const doc = createOverlay('s-title2')
+  doc.nodes['T-unknown'] = {
+    id: 'T-unknown',
+    kind: 'turn',
+    parentId: null,
+    position: { x: 0, y: 0 },
+    seq: 1,
+    sourceRef: { kind: 'user-message', eventId: 'evt-never-seen' },
+  }
+  doc.focusId = 'T-unknown'
+  const derived = buildDerivedTitleIndex(doc, [{ eventId: 'evt-other', title: '别的' }])
+  const r = computeInjection({
+    decision: { kind: 'enter', messages: [{ id: 'u1', role: 'user' }] },
+    payload: { sessionId: 's-title2', messages: [{ id: 'u1', role: 'user' }] },
+    doc,
+    pending: createPending(),
+    derivedTitles: derived,
+    snapshotStore: null,
+  })
+  assert.equal(r.status, INJECT_DONE)
+  assert.match(r.meta.text, /当前焦点：《（未命名）》/, '读不到标题时要如实说「未命名」，不能假装有名字')
+})
+
+test('注解优先于持久化标题（用户的注解永远赢）', () => {
+  const doc = createOverlay('s-title3')
+  doc.nodes['T-a'] = {
+    id: 'T-a',
+    kind: 'turn',
+    parentId: null,
+    position: { x: 0, y: 0 },
+    seq: 1,
+    title: '我的注解',
+    sourceRef: { kind: 'user-message', eventId: 'evt-a' },
+  }
+  doc.focusId = 'T-a'
+  const derived = buildDerivedTitleIndex(doc, [{ eventId: 'evt-a', title: '原文' }])
+  const r = computeInjection({
+    decision: { kind: 'enter', messages: [{ id: 'u1', role: 'user' }] },
+    payload: { sessionId: 's-title3', messages: [{ id: 'u1', role: 'user' }] },
+    doc,
+    pending: createPending(),
+    derivedTitles: derived,
+    snapshotStore: null,
+  })
+  assert.match(r.meta.text, /当前焦点：《我的注解》/)
+  assert.doesNotMatch(r.meta.text, /原文/)
 })
 
 // ───────────────────────────── 报告 ─────────────────────────────
