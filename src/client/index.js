@@ -83,6 +83,7 @@ function buildRemoteContribution() {
       mk('load', [remoteParam('sessionId')]),
       mk('save', [remoteParam('sessionId'), remoteParam('doc'), remoteParam('baseRev')]),
       mk('describe', []),
+      mk('events', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
     ],
   }
 }

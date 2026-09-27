@@ -105,6 +105,30 @@ if (!clientShape.service || !clientShape.pkg) {
 // 服务实例无法在这里构造（需要 ctx），改为校验「宿主源码里确实提供了这些形状」。
 const hostSource = readFileSync(join(root, 'src', 'host', 'storage.js'), 'utf8')
 
+// 逐方法对齐：marker 里声明的方法 必须与契约里的 descriptors 完全同集合。
+// 这条断言是补出来的 —— 之前 `events` 加了 marker 却漏了 `mk(...)`，
+// 而当时的「两侧一致性」测试只比对了两份契约（同样都漏），所以没抓到。
+{
+  const markerMatch = hostSource.match(/markRemoteMethods\([^,]+,\s*\[([^\]]*)\]/)
+  const markerMethods = markerMatch
+    ? [...markerMatch[1].matchAll(/'([^']+)'/g)].map((m) => m[1]).sort()
+    : []
+  const contractMethods = hostContribution.descriptors.map((d) => d.method).sort()
+  if (markerMethods.length === 0) {
+    bad('解析不出 markRemoteMethods 的方法列表')
+  } else if (JSON.stringify(markerMethods) === JSON.stringify(contractMethods)) {
+    ok(
+      `marker 方法与契约集合一致（${markerMethods.length} 个：${markerMethods.join(', ')}）` +
+        ' —— 两边都漏同一个方法的情况也能抓到',
+    )
+  } else {
+    bad(
+      `marker 与契约不同集合：marker=[${markerMethods}] 契约=[${contractMethods}]` +
+        '（说明有一侧漏登记了端点）',
+    )
+  }
+}
+
 if (hostSource.includes(`'${REMOTE_METHOD_DESCRIPTOR}'`)) {
   ok('宿主源码使用协议规定的 marker 键（含字符串常量）')
 } else if (hostSource.includes(REMOTE_METHOD_DESCRIPTOR)) {
@@ -227,6 +251,66 @@ if (/projectionChain/.test(hostSource)) {
   ok('投影写入串行化（避免同源事件并发读-改-写交错）')
 } else {
   bad('投影没有串行化')
+}
+
+// ── 6. D3-8 / 卡 8 禁词检查：可执行入口里不得有「生成导图」这类东西 ──────────────
+//
+// 规格 §6.3 与 02-实施计划.md 卡 8 都强调：**不要全文 grep 文档**（允许帮助文字里写
+// 「禁止一键生成思维导图」），要检查**可执行入口**：工具注册表、命令面板、按钮 label、
+// agent 可调工具名。所以这里查的是代码里的注册面，不是文档。
+const allSources = [
+  ['src/host/storage.js', hostSource],
+  ['src/client/index.js', clientSource],
+  ['src/host/index.js', readFileSync(join(root, 'src', 'host', 'index.js'), 'utf8')],
+  ['src/overlay/project.js', readFileSync(join(root, 'src', 'overlay', 'project.js'), 'utf8')],
+]
+
+// 1) 没有注册任何 agent 工具 → 自然也没有写工具（规格红线：模型只读图）
+let toolRegistrations = 0
+for (const [name, src] of allSources) {
+  const code = src
+    .split(/\r?\n/)
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n')
+  const hits = (code.match(/ctx\.tools|defineTool|tools\.register/g) ?? []).length
+  toolRegistrations += hits
+  if (hits > 0) bad(`${name} 里出现工具注册面 —— 卡 6 才允许加只读工具，且必须走审核`)
+}
+if (toolRegistrations === 0) {
+  ok('没有注册任何 agent 工具（模型无法改动图，D3-8 的一部分）')
+}
+
+// 2) 可执行入口里没有「一次成树 / 生成导图」类名字
+const forbidden = /生成导图|思维导图|自动成图|整理成树|一键成树|generateMap|mindmap|autoTree|buildTree/i
+let forbiddenHits = []
+for (const [name, src] of allSources) {
+  // 只查**代码行**（去掉注释）：注释里写「禁止一次生成整张思维导图」是允许的
+  const code = src
+    .split(/\r?\n/)
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n')
+  if (forbidden.test(code)) forbiddenHits.push(name)
+}
+if (forbiddenHits.length === 0) {
+  ok('可执行代码里没有「生成导图 / 一次成树」类入口（注释里的红线说明不算）')
+} else {
+  bad('可执行代码里出现禁词入口：' + forbiddenHits.join(', '))
+}
+
+// 3) 面板里只允许「收起/展开」这一个控件 —— 不该出现任何"生成/整理"类按钮。
+// 用宽松匹配：只要有 h('button' 出现，就把后面一小段文本里的所有单引号字面量当候选 label。
+const buttonLabels = []
+for (const m of clientSource.matchAll(/h\(\s*'button'[\s\S]{0,400}?\n\s*\)/g)) {
+  for (const lit of m[0].matchAll(/'([^']{1,40})'/g)) buttonLabels.push(lit[1])
+}
+const labels = [...new Set(buttonLabels)]
+const suspicious = labels.filter((l) => /生成|整理|组织|规划|建议|自动/.test(l))
+if (labels.length === 0) {
+  info('（没能从源码里解出按钮 label，跳过这条 —— 但上面的禁词扫描已覆盖代码面）')
+} else if (suspicious.length === 0) {
+  ok(`面板按钮 label = ${JSON.stringify(labels)} —— 没有生成/整理类入口`)
+} else {
+  bad('面板里出现可疑按钮：' + suspicious.join(', '))
 }
 
 // ── 报告 ────────────────────────────────────────────────────────────────────

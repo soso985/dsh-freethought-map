@@ -474,6 +474,30 @@ if (pageErrors.length) {
     } else {
       bad(`load 读回的 rev 不对：${JSON.stringify(reloaded).slice(0, 240)}`)
     }
+
+    // 6) events 端点：这是卡 3 的验收面（区分「没收到事件」与「收到了但去重跳过」）。
+    //    这一条同时证明「端点登记进契约」这件事在运行期也成立 —— 之前 events 加了 marker
+    //    却漏了 mk(...)，是契约断言补上之后才发现的。
+    const evs = await rpc('events', { sessionId, sinceSeq: -1 })
+    if (evs && evs.ok === true && Array.isArray(evs.value && evs.value.entries)) {
+      ok(`events 端点可达（当前记录 ${evs.value.entries.length} 条结算事件）`)
+      if (evs.value.entries.length > 0) {
+        const e = evs.value.entries[0]
+        info(`  最近一条：type=${e.type} eventId=${e.eventId} seq=${e.seq} outcome=${e.outcome}`)
+      } else {
+        info('  本会话还没有结算事件 —— 落链需要真实收发消息才会发生')
+      }
+    } else {
+      bad(`events 端点不可达或返回异常：${JSON.stringify(evs).slice(0, 240)}`)
+    }
+
+    // 7) 未知端点必须被拒（证明不是「什么都放行」）
+    const bogus = await rpc('doesNotExist', { sessionId })
+    if (bogus && bogus.ok === false) {
+      ok(`未知端点被拒（ok=false, code=${(bogus.error && bogus.error.code) || '?'}）`)
+    } else {
+      info(`未知端点的返回：${JSON.stringify(bogus).slice(0, 200)}`)
+    }
   }
 }
 
