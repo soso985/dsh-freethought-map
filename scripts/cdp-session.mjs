@@ -498,6 +498,79 @@ if (pageErrors.length) {
     } else {
       info(`未知端点的返回：${JSON.stringify(bogus).slice(0, 200)}`)
     }
+
+    // 8) 卡 8：导出 JSON / Markdown（走真实 RPC，不是只跑纯函数）
+    //
+    // ⚠️ 注意返回值有两层 ok：外层是网关的 RemoteResult（ok/value/error），
+    // 内层是我们端点自己返回的 {ok, text}。所以是 `value.value.text`。
+    const expJson = await rpc('exportDoc', { sessionId, kind: 'json' })
+    const jsonPayload = expJson && expJson.ok === true ? expJson.value : null
+    if (jsonPayload && jsonPayload.ok === true && typeof jsonPayload.text === 'string') {
+      const parsed = JSON.parse(jsonPayload.text)
+      ok(`exportDoc(json) → ok，导出了 ${Object.keys(parsed.nodes || {}).length} 个节点、version=${parsed.version}`)
+    } else {
+      bad(`exportDoc(json) 失败：${JSON.stringify(expJson).slice(0, 240)}`)
+    }
+
+    const expMd = await rpc('exportDoc', { sessionId, kind: 'markdown' })
+    const mdPayload = expMd && expMd.ok === true ? expMd.value : null
+    if (mdPayload && mdPayload.ok === true && String(mdPayload.text).includes('#')) {
+      ok(`exportDoc(markdown) → ok，${String(mdPayload.text).length} 字符`)
+    } else {
+      bad(`exportDoc(markdown) 失败：${JSON.stringify(expMd).slice(0, 240)}`)
+    }
+
+    // 9) PNG 必须**明确拒绝**而不是给一张空图
+    const expPng = await rpc('exportDoc', { sessionId, kind: 'png' })
+    const pngPayload = expPng && expPng.ok === true ? expPng.value : null
+    if (pngPayload && pngPayload.ok === false && String(pngPayload.error).includes('画布')) {
+      ok('exportDoc(png) 明确拒绝并说明原因（刻意不导出假空图）')
+    } else {
+      info(`exportDoc(png) 的返回：${JSON.stringify(expPng).slice(0, 200)}`)
+    }
+
+    // 10) 导出→导入 真实往返（同一会话应当被接受）
+    if (jsonPayload && jsonPayload.text) {
+      const roundTrip = await rpc('importDoc', { sessionId, json: jsonPayload.text })
+      const rtValue = roundTrip && roundTrip.ok === true ? roundTrip.value : null
+      if (rtValue && rtValue.ok === true) {
+        ok(`导出→导入 往返被接受（updated=${rtValue.stats && rtValue.stats.updated}，added=${rtValue.stats && rtValue.stats.added}）`)
+      } else {
+        bad(`导出→导入 往返被拒（不该拒绝自己的导出）：${JSON.stringify(roundTrip).slice(0, 300)}`)
+      }
+
+      // 11) **导入错 sessionId 必须被拒**（卡 8 硬验收）
+      const wrongSession = await rpc('importDoc', {
+        sessionId,
+        json: jsonPayload.text.replace(new RegExp(sessionId, 'g'), 'session-NOT-MINE'),
+      })
+      const wsValue = wrongSession && wrongSession.ok === true ? wrongSession.value : null
+      if (wsValue && wsValue.ok === false && String(wsValue.error).includes('session-mismatch')) {
+        ok('导入错 sessionId 被**硬拒绝**（禁止导入进错会话）')
+      } else {
+        bad(`导入错 sessionId 没有被拒：${JSON.stringify(wrongSession).slice(0, 300)}`)
+      }
+    } else {
+      bad('拿不到导出的 JSON，跳过往返与错会话校验')
+    }
+
+    // 12) 坏 JSON 被拒且不抛异常
+    const badJson = await rpc('importDoc', { sessionId, json: '{这不是 JSON' })
+    const bjValue = badJson && badJson.ok === true ? badJson.value : null
+    if (bjValue && bjValue.ok === false) {
+      ok('坏 JSON 被拒（返回可读错误，不抛异常）')
+    } else {
+      bad(`坏 JSON 没被拒：${JSON.stringify(badJson).slice(0, 200)}`)
+    }
+
+    // 13) 重建投影：传空窗口应当是安全的 no-op，且不得报告违规
+    const rebuilt = await rpc('rebuild', { sessionId, events: [] })
+    const rbValue = rebuilt && rebuilt.ok === true ? rebuilt.value : null
+    if (rbValue && rbValue.ok === true) {
+      ok(`rebuild（空窗口）→ ok，appended=${rbValue.appended}，violations=${(rbValue.violations || []).length}`)
+    } else {
+      bad(`rebuild 失败：${JSON.stringify(rebuilt).slice(0, 240)}`)
+    }
   }
 }
 

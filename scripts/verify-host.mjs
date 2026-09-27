@@ -335,20 +335,39 @@ const allSources = [
 }
 
 // 2) 可执行入口里没有「一次成树 / 生成导图」类名字
+//
+// ⚠️ 卡 8 的实施计划原文：「检查**可执行入口**：工具注册表、命令面板、按钮 label、
+//    agent 可调工具名。**允许**文档/帮助出现「禁止一键生成思维导图」字样。」
+//
+// 所以这里必须把「帮助正文」排除掉 —— 帮助是要**说明**这件事的，正文里必然出现这个词。
+// 光剥注释不够（帮助文本是字符串字面量，不是注释）。本轮就是被这个坑了一次：
+// 帮助文本加进去之后这条立刻误报。
+const HELP_TEXT_BLOCK = /const HELP_TEXT = `[\s\S]*?`/g
+
 const forbidden = /生成导图|思维导图|自动成图|整理成树|一键成树|generateMap|mindmap|autoTree|buildTree/i
 let forbiddenHits = []
 for (const [name, src] of allSources) {
-  // 只查**代码行**（去掉注释）：注释里写「禁止一次生成整张思维导图」是允许的
   const code = src
     .split(/\r?\n/)
-    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)) // 去掉注释行
     .join('\n')
+    .replace(HELP_TEXT_BLOCK, 'const HELP_TEXT = ""') // 去掉帮助正文（它就是要说这件事）
   if (forbidden.test(code)) forbiddenHits.push(name)
 }
 if (forbiddenHits.length === 0) {
-  ok('可执行代码里没有「生成导图 / 一次成树」类入口（注释里的红线说明不算）')
+  ok('可执行代码里没有「生成导图 / 一次成树」类入口（注释与帮助正文不算）')
 } else {
   bad('可执行代码里出现禁词入口：' + forbiddenHits.join(', '))
+}
+
+// 2b) 反过来也要成立：帮助正文里**必须**有那句说明（否则用户不知道这是刻意不做的）
+{
+  const helpSource = readFileSync(join(root, 'src', 'overlay', 'io.js'), 'utf8')
+  if (helpSource.includes('禁止一键生成思维导图')) {
+    ok('帮助正文里明确写了「刻意不做一键生成」（说明而不是入口）')
+  } else {
+    bad('帮助里没有说明「刻意不做一键生成思维导图」—— 用户会以为是没做')
+  }
 }
 
 // 3) 面板里只允许「收起/展开」这一个控件 —— 不该出现任何"生成/整理"类按钮。

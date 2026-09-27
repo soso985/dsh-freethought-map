@@ -34,12 +34,21 @@ import { setCanSetParent } from '../overlay/undo.js'
 import {
   SettlementLog,
   applyProjection,
+  backfill,
   planProjection,
   settlementKindOf,
 } from '../overlay/project.js'
 import { createPending, pendingAdd, pendingRemove } from '../overlay/links.js'
 import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
 import { registerReadonlyTools } from '../overlay/tools.js'
+import {
+  exportJson,
+  exportMarkdown,
+  mergeImport,
+  parseJsonSafely,
+  rebuildProjection,
+  validateImport,
+} from '../overlay/io.js'
 
 /**
  * 领域层与 json 后端实际强制执行的名称正则（`dsh-storage/lib/index.js:80`）：
@@ -300,6 +309,103 @@ class FreethoughtMapHostService {
     const since = Number.isInteger(sinceSeq) ? sinceSeq : -1
     return { ok: true, entries: injectionLog.list(sessionId, since) }
   }
+  /**
+   * 导出：`kind` 取 `'json'` | `'markdown'`（卡 8）。
+   *
+   * PNG 不在宿主侧 —— 它需要真画布，只能由客户端渲染。宿主**不做假的空图**，
+   * 而是明确返回一个可读的说明（见下面的 png 分支）。
+   */
+  async exportDoc(sessionId, kind) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    const domain = await readyDomain(this.getDomain)
+    if (!domain) return { ok: false, error: '存储领域尚未就绪' }
+    const doc = domain.table(TABLE).get(sessionId)
+    if (!doc) return { ok: false, error: '该会话还没有图' }
+
+    if (kind === 'png') {
+      return {
+        ok: false,
+        error: 'PNG 导出需要画布，画布还没做 —— 这里刻意不导出空图（那会给你一张假的图）。',
+      }
+    }
+    if (kind === 'markdown') {
+      return { ok: true, kind, text: exportMarkdown(doc, { derivedTitles: derivedTitleIndex(sessionId) }) }
+    }
+    return { ok: true, kind: 'json', text: exportJson(doc, { now: Date.now() }) }
+  }
+
+  /**
+   * 导入：校验 + 合并（卡 8，规格 §11）。
+   *
+   * 合并**不是**整份替换：文件里的 manual/parentId/position/注解/hidden/粉线采用文件，
+   * 但 canonical 仍需要且未在 hidden 中的投影**不得删除**（`mergeImport` 负责）。
+   *
+   * @param {string} sessionId
+   * @param {string} json 导入的 JSON 文本
+   */
+  async importDoc(sessionId, json) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    const parsed = parseJsonSafely(json)
+    if (!parsed.ok) return { ok: false, error: 'JSON 解析失败：' + String(parsed.detail || parsed.reason) }
+
+    const v = validateImport(parsed.value, {
+      sessionId,
+      jsonBytes: typeof json === 'string' ? json.length : 0,
+    })
+    if (!v.ok) {
+      return { ok: false, error: '导入被拒绝（' + v.reason + '）' + (v.detail ? '：' + v.detail : '') }
+    }
+
+    const domain = await readyDomain(this.getDomain)
+    if (!domain) return { ok: false, error: '存储领域尚未就绪' }
+    const table = domain.table(TABLE)
+
+    let merged = null
+    await table.update(sessionId, (current) => {
+      const base = current === undefined || current === null ? createOverlay(sessionId) : current
+      const r = mergeImport(base, v.doc)
+      merged = r
+      return r.doc
+    })
+
+    return {
+      ok: true,
+      warnings: v.warnings,
+      stats: merged ? merged.stats : null,
+      doc: merged ? merged.doc : null,
+    }
+  }
+
+  /**
+   * 重建投影（卡 8 / 规格 §6.5）：对**当前已加载窗口**跑落链算法。
+   *
+   * `events` 由客户端从官方会话读取后传入 —— 宿主拿不到"当前已加载窗口"这个概念，
+   * 那是客户端视图状态。
+   *
+   * @param {string} sessionId
+   * @param {any[]} events
+   */
+  async rebuild(sessionId, events) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    if (!Array.isArray(events)) return { ok: false, error: 'events 必须是数组' }
+    const domain = await readyDomain(this.getDomain)
+    if (!domain) return { ok: false, error: '存储领域尚未就绪' }
+    const table = domain.table(TABLE)
+
+    let out = null
+    await table.update(sessionId, (current) => {
+      const base = current === undefined || current === null ? createOverlay(sessionId) : current
+      out = rebuildProjection(base, events, { backfill })
+      return out.doc
+    })
+    return { ok: true, appended: out ? out.appended : 0, skipped: out ? out.skipped : 0, violations: out ? out.violations : [] }
+  }
 }
 
 /**
@@ -320,7 +426,7 @@ const injectedSnapshots = new Map()
 /** 注入诊断日志（卡 5）：记「哪一轮注入了什么」。 */
 const injectionLog = new SettlementLog(200)
 
-// 端点名由 marker 决定：freethoughtMap/load、save、describe、events、setPendingLinks、injections。
+// 端点名由 marker 决定，见 docs/HOST.md §3.15。
 markRemoteMethods(FreethoughtMapHostService, [
   'load',
   'save',
@@ -328,6 +434,9 @@ markRemoteMethods(FreethoughtMapHostService, [
   'events',
   'setPendingLinks',
   'injections',
+  'exportDoc',
+  'importDoc',
+  'rebuild',
 ])
 
 function describeError(e) {
@@ -381,6 +490,9 @@ export function buildRemoteContribution() {
       mk('events', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
       mk('setPendingLinks', [remoteParam('sessionId'), remoteParam('payload')]),
       mk('injections', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
+      mk('exportDoc', [remoteParam('sessionId'), remoteParam('kind')]),
+      mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
+      mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
     ],
   }
 }

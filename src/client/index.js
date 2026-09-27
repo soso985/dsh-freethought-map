@@ -27,6 +27,35 @@ const PLUGIN_ID = 'dsh-freethought-map'
 const TAB_KIND = 'freethoughtmap'
 const TAB_ADDRESS = 'freethoughtmap://session'
 const ROOT_ATTR = 'data-freethought-map-root'
+
+/**
+ * 帮助短文 —— 由 `src/overlay/io.js` 的 `helpText()` **编译**过来（`scripts/build-help.mjs`）。
+ *
+ * 为什么是编译而不是运行期取：客户端 bundle 是单文件自包含的惰性 CJS 注册，
+ * **不能 import 相对模块**（官方 README 明令）。所以这里放一份逐字副本，
+ * 并由 `verify-io.mjs` 的断言锁住它与 `helpText()` 完全一致 ——
+ * 改了一边不改另一边会直接红。
+ */
+const HELP_TEXT = `这块面板是会话思路图，不是聊天窗口 —— 说话还是在官方输入框里。
+
+## 图是怎么长出来的
+每完成一轮（你发一句、模型答完），图里就多两个节点。它们按时间连成一条链。
+
+## 你能做的
+· 点一行：把焦点移过去（下一句默认挂在它下面）
+· 「跳到气泡」：回到官方对话里对应的那一条
+· 手建节点、拖动、改父、写注解、摘除 —— 这些操作都可以 Ctrl+Z 撤销
+
+## 图会被怎样使用
+发送前会把**当前焦点**和**这一轮新拉的自由联想**以「[用户图数据]」的形式附在消息后面。
+模型只能读图，不能改图 —— 结构永远是你说了算。
+
+## 几点要知道的
+· **刷新后不能 Ctrl+Z 跨刷新**：撤销历史只活在内存里；图本身存在本地，不会丢。
+· 撤销历史**按会话分开**，切换会话会换一套历史。
+· 「摘除」不是删除对话 —— 对话还在，图里不再显示它，也不会被自动补链建回来。
+· 帮助里出现「禁止一键生成思维导图」是说明：这个产品**刻意不做**自动成树，
+  结构必须由你自己长出来或手建。`
 const WIDTH_KEY = 'freethought-map:panel-width:v1'
 const COLLAPSED_KEY = 'freethought-map:panel-collapsed:v1'
 
@@ -86,6 +115,9 @@ function buildRemoteContribution() {
       mk('events', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
       mk('setPendingLinks', [remoteParam('sessionId'), remoteParam('payload')]),
       mk('injections', [remoteParam('sessionId'), remoteParam('sinceSeq')]),
+      mk('exportDoc', [remoteParam('sessionId'), remoteParam('kind')]),
+      mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
+      mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
     ],
   }
 }
@@ -100,6 +132,23 @@ function clampWidth(value) {
   const n = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(n)) return PANEL_WIDTH_DEFAULT
   return Math.min(PANEL_WIDTH_MAX, Math.max(PANEL_WIDTH_MIN, Math.round(n)))
+}
+
+/**
+ * 读出「当前已加载窗口」的会话事件，供「重建投影」用。
+ *
+ * ⚠️ 老实说：**官方没有公开的"已加载窗口"读取接口**。卡 1 的 P2 探针已经证明了这一点
+ * （会话内容只能通过内部 DOM 拿到，没有公开 API）。所以这里返回 `null`，
+ * 由 UI 如实说明「重建已跳过，没有假装成功」。
+ *
+ * 为什么不放一个"以后补上"的桩：那会让 UI 在**看起来成功**的情况下什么都不做，
+ * 而你会以为图已经重建过了。明确说"做不到"比假装做到有用得多。
+ *
+ * 一旦宿主暴露了合规的读取途径，只需在这里返回按 `seq` 升序的
+ * `Array<{type, seq, data, surfaceOp}>` —— 重建链路的其余部分都已就绪且有 39 条断言守着。
+ */
+function collectWindowEvents(_ctx, _sessionId) {
+  return null
 }
 
 function createPlugin(React) {
@@ -350,6 +399,23 @@ function createPlugin(React) {
   opacity: 0;
 }
 [${ROOT_ATTR}] .ftm-chain-row:hover .ftm-chain-jump { opacity: 1; }
+[${ROOT_ATTR}] .ftm-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+[${ROOT_ATTR}] .ftm-tools .ftm-btn { flex: 0 0 auto; }
+[${ROOT_ATTR}] .ftm-help {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  font-size: 0.92em;
+  line-height: 1.5;
+  border: 1px solid var(--dsw-alias-border-1, rgba(128, 128, 128, 0.35));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-2, rgba(128, 128, 128, 0.08));
+}
+[${ROOT_ATTR}] .ftm-notice[data-ftm-notice='info'] { border-color: var(--dsw-alias-border-1, rgba(128, 128, 128, 0.45)); }
 [${ROOT_ATTR}] .ftm-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0 0 10px; }
 [${ROOT_ATTR}] .ftm-kv dt { opacity: 0.72; white-space: nowrap; }
 [${ROOT_ATTR}] .ftm-kv dd {
@@ -444,6 +510,131 @@ function createPlugin(React) {
       const [highlightId, setHighlightId] = useState(null)
       /** 「跳到气泡」的可见反馈（找不到 / 命中多个 都要说出来，不静默） */
       const [jumpNotice, setJumpNotice] = useState(null)
+      /** 卡 8：帮助面板开合 */
+      const [showHelp, setShowHelp] = useState(false)
+      /** 卡 8：导入/导出的操作结果提示 */
+      const [ioNotice, setIoNotice] = useState(null)
+
+      /**
+       * 卡 8 的三个动作，全走宿主 RPC。
+       *
+       * 注意导出的返回值有**两层 ok**：外层是网关的 RemoteResult，内层是我们端点自己的
+       * `{ok, text}`。所以是 `r.value.ok` / `r.value.text` —— 少写一层会把 undefined 当成成功。
+       */
+      const runExport = (kind) => {
+        const sid = authority.sessionId
+        if (!sid) return
+        setIoNotice({ tone: 'info', text: '正在导出…' })
+        callRemote(ctx, 'exportDoc', { sessionId: sid, kind }).then((r) => {
+          const payload = r && r.ok === true ? r.value : null
+          if (!payload) {
+            setIoNotice({ tone: 'warn', text: remoteError(r) })
+            return
+          }
+          if (payload.ok !== true) {
+            // PNG 会走到这里：明确说明它需要画布
+            setIoNotice({ tone: 'warn', text: String(payload.error || '导出失败') })
+            return
+          }
+          const isJson = kind === 'json'
+          const name =
+            'freethought-map-' + String(sid).slice(-8) + (isJson ? '.json' : '.md')
+          const mime = isJson ? 'application/json' : 'text/markdown'
+          try {
+            const blob = new Blob([payload.text], { type: mime + ';charset=utf-8' })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = name
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            setTimeout(() => URL.revokeObjectURL(url), 4000)
+            setIoNotice({ tone: 'ok', text: '已导出 ' + name })
+          } catch (e) {
+            setIoNotice({ tone: 'warn', text: '触发下载失败：' + describeError(e) })
+          }
+        })
+      }
+
+      const runImport = () => {
+        const sid = authority.sessionId
+        if (!sid) return
+        try {
+          const input = document.createElement('input')
+          input.type = 'file'
+          input.accept = '.json,application/json'
+          input.onchange = () => {
+            const file = input.files && input.files[0]
+            if (!file) return
+            const reader = new FileReader()
+            reader.onerror = () => setIoNotice({ tone: 'warn', text: '读文件失败' })
+            reader.onload = () => {
+              callRemote(ctx, 'importDoc', { sessionId: sid, json: String(reader.result) }).then((r) => {
+                const payload = r && r.ok === true ? r.value : null
+                if (!payload) {
+                  setIoNotice({ tone: 'warn', text: remoteError(r) })
+                  return
+                }
+                if (payload.ok !== true) {
+                  setIoNotice({ tone: 'warn', text: String(payload.error || '导入被拒绝') })
+                  return
+                }
+                const st = payload.stats || {}
+                setIoNotice({
+                  tone: 'ok',
+                  text:
+                    '导入完成：更新 ' + String(st.updated || 0) + '、新增 ' + String(st.added || 0) +
+                    '、保留 ' + String(st.kept || 0) +
+                    (payload.warnings && payload.warnings.length ? '；' + payload.warnings.join('；') : ''),
+                })
+                // 合并已经写进权威了，读回最新的一份
+                loadAuthority()
+              })
+            }
+            reader.readAsText(file)
+          }
+          input.click()
+        } catch (e) {
+          setIoNotice({ tone: 'warn', text: '打开文件选择器失败：' + describeError(e) })
+        }
+      }
+
+      /**
+       * 重建投影（卡 8 / 规格 §6.5）。
+       *
+       * 宿主拿不到「当前已加载窗口」这个概念 —— 那是客户端视图状态，所以由这里读出
+       * 官方会话事件再传过去。取不到事件时如实说明，不假装重建成功。
+       */
+      const runRebuild = () => {
+        const sid = authority.sessionId
+        if (!sid) return
+        const events = collectWindowEvents(ctx, sid)
+        if (events === null) {
+          setIoNotice({
+            tone: 'warn',
+            text: '拿不到本会话的事件（官方没有公开的"已加载窗口"读取接口）—— 重建已跳过，没有假装成功。',
+          })
+          return
+        }
+        setIoNotice({ tone: 'info', text: '正在重建投影（窗口内 ' + String(events.length) + ' 条事件）…' })
+        callRemote(ctx, 'rebuild', { sessionId: sid, events }).then((r) => {
+          const payload = r && r.ok === true ? r.value : null
+          if (!payload || payload.ok !== true) {
+            setIoNotice({ tone: 'warn', text: payload ? String(payload.error || '重建失败') : remoteError(r) })
+            return
+          }
+          const v = payload.violations || []
+          setIoNotice({
+            tone: v.length ? 'warn' : 'ok',
+            text:
+              '重建完成：补了 ' + String(payload.appended || 0) + ' 个节点，跳过 ' +
+              String(payload.skipped || 0) + ' 个' +
+              (v.length ? '；**有 ' + String(v.length) + ' 处覆盖了已有结构**：' + v.slice(0, 3).join('；') : ''),
+          })
+          loadAuthority()
+        })
+      }
 
       /**
        * 从宿主的事件日志里取派生标题。
@@ -469,21 +660,27 @@ function createPlugin(React) {
         [ctx],
       )
 
-      // 会话变了（或首次挂载）→ 从宿主 load 权威。用自增计数丢弃过期响应。
-      useEffect(() => {
-        if (!sessionId) {
-          setAuthority({ sessionId: undefined, doc: null, rev: -1, status: 'idle', notice: '' })
-          return undefined
-        }
-        const ticket = ++inflight.current
-        setAuthority((s) => ({ ...s, sessionId, status: 'loading', notice: '' }))
+      /**
+       * 从宿主读回权威 overlay。
+       *
+       * 抽成 callback 是因为卡 8 的导入/重建之后也要重读一次（它们已经写进权威了）。
+       * 用自增计数丢弃过期响应 —— 切会话时旧请求可能后到，整包丢弃避免串会话。
+       */
+      const loadAuthority = useCallback(
+        (sid) => {
+          const target = sid || sessionId
+          if (!target) {
+            setAuthority({ sessionId: undefined, doc: null, rev: -1, status: 'idle', notice: '' })
+            return
+          }
+          const ticket = ++inflight.current
+          setAuthority((s) => ({ ...s, sessionId: target, status: 'loading', notice: '' }))
 
-        callRemote(ctx, 'load', { sessionId }).then(
-          (r) => {
+          callRemote(ctx, 'load', { sessionId: target }).then((r) => {
             if (ticket !== inflight.current) return // 过期响应（已切走）—— 整包丢弃
             if (!r || r.ok !== true) {
               setAuthority({
-                sessionId,
+                sessionId: target,
                 doc: null,
                 rev: -1,
                 status: 'failed',
@@ -494,7 +691,7 @@ function createPlugin(React) {
             const payload = r.value ?? {}
             if (payload.ok !== true) {
               setAuthority({
-                sessionId,
+                sessionId: target,
                 doc: null,
                 rev: -1,
                 status: 'failed',
@@ -502,22 +699,37 @@ function createPlugin(React) {
               })
               return
             }
-            setAuthority({ sessionId, doc: payload.doc, rev: payload.rev, status: 'ready', notice: '' })
-            loadDerivedTitles(sessionId)
-          },
-          (e) => {
+            setAuthority({
+              sessionId: target,
+              doc: payload.doc,
+              rev: payload.rev,
+              status: 'ready',
+              notice: '',
+            })
+            loadDerivedTitles(target)
+          }, (e) => {
             if (ticket !== inflight.current) return
             setAuthority({
-              sessionId,
+              sessionId: target,
               doc: null,
               rev: -1,
               status: 'failed',
               notice: '读取宿主权威数据失败：' + describeError(e),
             })
-          },
-        )
+          })
+        },
+        [ctx, sessionId, loadDerivedTitles],
+      )
+
+      // 会话变了（或首次挂载）→ 读一次权威
+      useEffect(() => {
+        if (!sessionId) {
+          setAuthority({ sessionId: undefined, doc: null, rev: -1, status: 'idle', notice: '' })
+          return undefined
+        }
+        loadAuthority(sessionId)
         return undefined
-      }, [sessionId, loadDerivedTitles])
+      }, [sessionId, loadAuthority])
 
       /**
        * 保存到宿主权威。演示卡 2 的完整协议：
@@ -763,6 +975,50 @@ function createPlugin(React) {
           { className: 'ftm-hint' },
           '链（点一行把焦点移过去；有对应气泡的可以跳过去）',
         ),
+        // ── 卡 8 操作条 ──
+        h(
+          'div',
+          { className: 'ftm-tools' },
+          h(
+            'button',
+            { className: 'ftm-btn', title: '导出为 JSON', onClick: () => runExport('json') },
+            '导出 JSON',
+          ),
+          h(
+            'button',
+            { className: 'ftm-btn', title: '导出为 Markdown 大纲', onClick: () => runExport('markdown') },
+            '导出 MD',
+          ),
+          h(
+            'button',
+            { className: 'ftm-btn', title: '从 JSON 导入（只接受本会话的导出）', onClick: runImport },
+            '导入',
+          ),
+          h(
+            'button',
+            { className: 'ftm-btn', title: '按官方会话重建投影', onClick: runRebuild },
+            '重建投影',
+          ),
+          h(
+            'button',
+            {
+              className: 'ftm-btn',
+              title: '帮助',
+              onClick: () => setShowHelp((v) => !v),
+            },
+            showHelp ? '收起帮助' : '帮助',
+          ),
+        ),
+        ioNotice
+          ? h(
+              'p',
+              { className: 'ftm-notice', role: 'status', 'data-ftm-notice': ioNotice.tone },
+              ioNotice.text,
+            )
+          : null,
+        showHelp
+          ? h('pre', { className: 'ftm-help', 'data-ftm-help': '1' }, HELP_TEXT)
+          : null,
         jumpNotice
           ? h(
               'p',
