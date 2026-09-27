@@ -573,6 +573,55 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
   }
 }
 
+// ── 10. pre-step 钩子探针（临时诊断，2026-09-27）──────────────────────────────
+//
+// 探针不参与产品逻辑，但它必须**每次调用都写**（含跳过与抛错），
+// 否则就分不清「钩子没被调用」和「被调用了但没注入」。这几条断言锁住这个性质。
+{
+  const probePath = join(root, 'src', 'host', 'hook-probe.js')
+  let probeSource = ''
+  try {
+    probeSource = readFileSync(probePath, 'utf8')
+  } catch {
+    bad('找不到 src/host/hook-probe.js —— 探针被删了？')
+  }
+  if (probeSource) {
+    if (/appendFileSync\(/.test(probeSource)) {
+      ok('探针用 appendFileSync **追加**写（保留历史，便于对比多次发送）')
+    } else {
+      bad('探针没有用追加写 —— 会覆盖掉上一次的记录')
+    }
+    if (/try\s*\{[\s\S]*appendFileSync[\s\S]*\}\s*catch/.test(probeSource)) {
+      ok('探针写盘包在 try/catch 里（写失败绝不影响对话）')
+    } else {
+      bad('探针写盘没有容错 —— 写失败会冒泡影响对话')
+    }
+    if (/export function buildProbeEntry\(/.test(probeSource)) {
+      ok('探针的记录构造是纯函数（可离线断言字段形状）')
+    } else {
+      bad('探针记录构造不是独立函数 —— 无法离线断言')
+    }
+    // 不该把注入正文全文写进日志（隐私 + 体积）
+    if (/textPreview/.test(probeSource) && !/text:\s*inj\.text\b/.test(probeSource)) {
+      ok('探针只写注入文本的**预览**，不写全文')
+    } else {
+      bad('探针可能把注入正文全文写进日志 —— 应只写预览')
+    }
+  }
+
+  // 宿主侧：探针必须写在 finally 里（成功/跳过/抛错三种情形都落一行）
+  if (/finally\s*\{[\s\S]{0,400}appendProbeEntry\(/.test(hostSource)) {
+    ok('探针写在 pre-step 的 finally 里 —— 抛错时也会落一行')
+  } else {
+    bad('探针不在 finally 里 —— 抛错的那次调用不会被记录，会误判成"钩子没跑"')
+  }
+  if (/import\s*\{\s*appendProbeEntry,\s*buildProbeEntry\s*\}/.test(hostSource)) {
+    ok('宿主已接入探针')
+  } else {
+    bad('宿主没有接入探针')
+  }
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 const fails = results.filter(([s]) => s === 'FAIL')
 const pad = Math.max(...results.map(([, m]) => m.length))

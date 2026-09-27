@@ -41,6 +41,7 @@ import {
 import { createPending, pendingAdd, pendingRemove } from '../overlay/links.js'
 import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
 import { registerReadonlyTools } from '../overlay/tools.js'
+import { appendProbeEntry, buildProbeEntry } from './hook-probe.js'
 import {
   exportJson,
   exportMarkdown,
@@ -680,28 +681,58 @@ export function apply(ctx) {
   ctx.effect(
     () => {
       const onPreStep = async (payload, next) => {
-        const decision = await next()
+        // 探针：**每次调用都写一行**（含抛错的情形），用来回答
+        // 「宿主到底有没有调用 agent/pre-step」。写盘失败不影响对话。
+        const startedAt = Date.now()
+        let probeOutcome = 'unknown'
+        let probeSessionId = null
+        let probeInjection = null
+        let probeError = null
+        let originalDecision = null
+        let finalDecision = null
+
+        const decision0 = await next()
+        originalDecision = decision0
         try {
           // 决策逻辑全在 `computeInjection`（纯函数，可离线验死）。
           // 这里只负责：取权威 doc、调它、记日志、把结果还给宿主。
-          if (!decision || decision.kind !== 'enter') return decision
+          if (!decision0 || decision0.kind !== 'enter') {
+            probeOutcome = 'decision-not-enter'
+            finalDecision = decision0
+            return decision0
+          }
           const sessionId = sessionOfAgent(payload && payload.agent)
-          if (!sessionId) return decision
+          probeSessionId = sessionId
+          if (!sessionId) {
+            probeOutcome = 'no-session-id'
+            finalDecision = decision0
+            return decision0
+          }
 
           // 领域打开是异步的 → 用已就绪的句柄；没就绪就不注入，绝不挡这一轮对话
           const domain = await readyDomain(getDomain)
-          if (!domain) return decision
+          if (!domain) {
+            probeOutcome = 'no-domain'
+            finalDecision = decision0
+            return decision0
+          }
           const doc = domain.table(TABLE).get(sessionId)
-          if (!doc) return decision
+          if (!doc) {
+            probeOutcome = 'no-doc'
+            finalDecision = decision0
+            return decision0
+          }
 
           const result = computeInjection({
-            decision,
+            decision: decision0,
             payload: { ...payload, sessionId },
             doc,
             pending: pendingBySession.get(sessionId) || createPending(),
             derivedTitles: derivedTitleIndex(sessionId),
             snapshotStore,
           })
+          probeOutcome = result.status
+          probeInjection = result.meta || null
 
           if (result.status === INJECT_DONE) {
             injectionLog.record(sessionId, syntheticEvent(payload, 'inject'), INJECT_DONE, result.meta)
@@ -712,11 +743,29 @@ export function apply(ctx) {
           } else {
             injectionLog.record(sessionId, syntheticEvent(payload, 'skip'), result.status)
           }
+          finalDecision = result.decision
           return result.decision
         } catch (e) {
           // 注入失败绝不能挡住这一轮对话 —— 记一条然后原样放行
-          log(ctx, 'pre-step 注入失败（已放行原决策）：' + describeError(e))
-          return decision
+          probeError = describeError(e)
+          probeOutcome = 'error'
+          finalDecision = decision0
+          log(ctx, 'pre-step 注入失败（已放行原决策）：' + probeError)
+          return decision0
+        } finally {
+          // 探针写在 finally 里：成功、跳过、抛错三种情形都会落一行
+          appendProbeEntry(
+            buildProbeEntry({
+              payload,
+              originalDecision,
+              finalDecision,
+              sessionId: probeSessionId,
+              outcome: probeOutcome,
+              injection: probeInjection,
+              durationMs: Date.now() - startedAt,
+              error: probeError,
+            }),
+          )
         }
       }
 
