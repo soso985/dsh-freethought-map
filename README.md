@@ -9,7 +9,6 @@
 ---
 
 ## 0. 两个仓库不是一回事（先读这一节）
-
 > ⚠️ 本项目有**两个完全不同的仓库**：一个是已发布的独立站，一个是本包（DSH 插件）。
 > **本包不是独立站，独立站也不能当插件装。**
 
@@ -102,15 +101,48 @@ $dsh  = "$env:TEMP\dsh-asar-extract\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js
 
 > `app.asar` 需要先解包才能读到与执行（解包命令见 [docs/HOST.md](docs/HOST.md) §1.1）。
 
-### 4.3 本包自己的静态验收
+### 4.3 本包自己的验收脚本
 
-不需要宿主，秒级可跑：
+不需要宿主、秒级可跑（**343 条断言**，覆盖全部八张卡的验收条）：
 
 ```powershell
-& $node --experimental-vm-modules E:\dsh-freethought-map\scripts\verify-package.mjs
+$node = 'E:\Harness\resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
+$s = 'E:\dsh-freethought-map\scripts'
+
+& $node --experimental-vm-modules $s\verify-package.mjs   # 13 条 · 包清单/语法/module loader id
+& $node $s\verify-overlay.mjs                            # 42 条 · overlay 纯函数（防环/上提/校验）
+& $node $s\verify-client.mjs                             # 37 条 · 客户端 bundle（样式隔离/键盘/端点契约）
+& $node $s\verify-host.mjs                               # 44 条 · 宿主接线与红线断言（防漂移/禁词/不变量）
+& $node $s\verify-project.mjs                            # 27 条 · 落链投影（合成事件）
+& $node $s\verify-locate.mjs                             # 25 条 · 图→气泡定位与降级行为
+& $node $s\verify-links.mjs                              # 29 条 · 粉线与发送快照
+& $node $s\verify-inject.mjs                             # 19 条 · 注入链路端到端（离线，不烧 token）
+& $node $s\verify-tools.mjs                              # 27 条 · 三个只读工具（用宿主真实 ToolRuntime 校验）
+& $node $s\verify-undo.mjs                               # 40 条 · 用户操作与撤销栈（含撤销↔重做往返）
+& $node $s\verify-io.mjs                                 # 40 条 · 导入导出与重建投影
 ```
 
-检查：清单字段齐全 · 两个导出指向真实文件 · 两个入口 ESM 语法可解析 · module loader 的 id 等于包名 · patch 行指向本包。
+需要真宿主的两套（起一个隔离实例，见 [docs/HOST.md](docs/HOST.md) §3.1）：
+
+```powershell
+& $s\verify-boot.ps1  -Port 19388     # 11 条 · 构建加载探针（P5）
+& $s\verify-session.ps1 -Port 19388   # 23 条 · 真浏览器：渲染/隔离/存储协议/导入导出往返
+```
+
+> 为什么能有 343 条离线断言：**产品的核心逻辑全部写成了纯函数**
+> （落链、定位、粉线、注入决策、撤销、导入导出），宿主侧只留"取数据 → 调纯函数 →
+> 写回"这一层薄壳。所以「注入到底注入了什么」这种看似必须真发消息才能验的事，
+> 也能离线验死。详见 [docs/HOST.md](docs/HOST.md) §3.12 / §3.14。
+
+### 4.4 改帮助文本时要重跑一次生成器
+
+帮助正文会被**编译**进客户端 bundle（bundle 不能 `import` 相对模块）：
+
+```powershell
+& $node E:\dsh-freethought-map\scripts\build-help.mjs
+```
+
+忘了跑也不会静默漂移 —— `verify-io.mjs` 有一条断言逐字比对两边，直接红。
 
 ---
 
