@@ -30,6 +30,7 @@ import {
 } from '../overlay/project.js'
 import { createPending, pendingAdd, pendingRemove } from '../overlay/links.js'
 import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
+import { registerReadonlyTools } from '../overlay/tools.js'
 
 /**
  * 领域层与 json 后端实际强制执行的名称正则（`dsh-storage/lib/index.js:80`）：
@@ -398,8 +399,9 @@ function log(ctx, message) {
  * 一定有它。真遇到没有它的 profile，让这一行明确失败比默默降级更好排查。
  *
  * `sessions` 是会话事件源（`'session/event'` 从它上面发），用于卡 3 的落链订阅。
+ * `tools` 是工具注册表，卡 6 的只读三工具挂在它上面。
  */
-export const inject = ['storageDomain', 'sessions']
+export const inject = ['storageDomain', 'sessions', 'tools']
 
 /**
  * 宿主插件入口。
@@ -599,7 +601,33 @@ export function apply(ctx) {
     'freethought-map: send-time injection',
   )
 
-  log(ctx, '宿主一半已激活：overlay 权威存储 + 落链 + 发送前注入（dsh 0.1.7-rc.2 c1275515）')
+  // (e) 只读三工具（卡 6 / 规格 §3 红线 2）。
+  //
+  // 两条铁律：
+  //   1. **只有只读工具**（`map_overview` / `map_get` / `map_search`）。
+  //      没有 add/create/link/move/hide/delete —— 「模型写结构」是红线，
+  //      写工具一旦存在，无论提示词怎么写模型都可能用它。
+  //   2. **会话身份来自执行上下文**（`exec.agent?.session.header.id`），
+  //      不是浏览器当前打开的会话。拿不到就**拒绝调用**，绝不猜、绝不退回"当前会话"。
+  //      这条在 `src/overlay/tools.js` 的 `sessionIdFromExecution` 里实现并单测。
+  ctx.effect(
+    () => {
+      const count = registerReadonlyTools(ctx, {
+        getDoc: async (sessionId) => {
+          const domain = await readyDomain(getDomain)
+          if (!domain) return null
+          const doc = domain.table(TABLE).get(sessionId)
+          return doc === undefined ? null : doc
+        },
+        derivedTitles: (sessionId) => derivedTitleIndex(sessionId),
+      })
+      log(ctx, '只读工具已注册（' + String(count) + ' 个，全部只读）')
+      return undefined
+    },
+    'freethought-map: readonly tools',
+  )
+
+  log(ctx, '宿主一半已激活：overlay 权威存储 + 落链 + 发送前注入 + 只读工具（dsh 0.1.7-rc.2 c1275515）')
 }
 
 /** 每会话一份「已拍下的发送快照」，供官方重试复用（规格 §10.3）。 */

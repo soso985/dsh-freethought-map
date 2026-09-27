@@ -251,8 +251,10 @@ if (/ctx\.off\(/.test(hostCode)) {
 } else {
   ok('没有手写 ctx.off（依赖 Cordis 的 scope-owned 监听器）')
 }
-if (hostSource.includes("inject = ['storageDomain', 'sessions']")) {
-  ok("声明了 inject = ['storageDomain', 'sessions']（事件源与存储都是硬依赖）")
+if (/inject = \['storageDomain', 'sessions', 'tools'\]/.test(hostSource)) {
+  ok("声明了 inject = ['storageDomain', 'sessions', 'tools']（存储 / 事件源 / 工具表都是硬依赖）")
+} else if (/inject = \['storageDomain', 'sessions'\]/.test(hostSource)) {
+  bad("inject 里缺 'tools' —— 卡 6 的只读工具注册不上")
 } else {
   bad('inject 声明与预期不符 —— 事件源缺失会让落链静默不发生')
 }
@@ -284,19 +286,52 @@ const allSources = [
   ['src/overlay/project.js', readFileSync(join(root, 'src', 'overlay', 'project.js'), 'utf8')],
 ]
 
-// 1) 没有注册任何 agent 工具 → 自然也没有写工具（规格红线：模型只读图）
-let toolRegistrations = 0
-for (const [name, src] of allSources) {
-  const code = src
+// 1) 只允许注册**只读**工具（卡 6）。写工具是红线。
+//    2026-09-27 卡 6 之前这里是「一处都不许有」；卡 6 之后改成「必须有且只有那三个只读工具」。
+{
+  const code = hostSource
     .split(/\r?\n/)
     .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
     .join('\n')
-  const hits = (code.match(/ctx\.tools|defineTool|tools\.register/g) ?? []).length
-  toolRegistrations += hits
-  if (hits > 0) bad(`${name} 里出现工具注册面 —— 卡 6 才允许加只读工具，且必须走审核`)
-}
-if (toolRegistrations === 0) {
-  ok('没有注册任何 agent 工具（模型无法改动图，D3-8 的一部分）')
+  const toolsSource = readFileSync(join(root, 'src', 'overlay', 'tools.js'), 'utf8')
+  const toolsCode = toolsSource
+    .split(/\r?\n/)
+    .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+    .join('\n')
+
+  if (!/registerReadonlyTools\(/.test(code)) {
+    bad('宿主没有走 registerReadonlyTools —— 卡 6 的三个只读工具应当已注册')
+  } else {
+    ok('宿主通过 registerReadonlyTools 注册工具（注册面集中在一个地方）')
+  }
+
+  // 写工具的红线：整个 overlay 目录不得出现注册写工具的意图
+  const writeToolHints = toolsCode.match(/name:\s*'(add|create|set|link|move|hide|delete|remove|update|write)\w*'/gi)
+  if (writeToolHints && writeToolHints.length > 0) {
+    bad('出现写工具定义：' + writeToolHints.join(', ') + '（红线：模型只能读图）')
+  } else {
+    ok('没有定义任何写工具（红线：模型只能读图，不能改图）')
+  }
+
+  // 三个工具名必须正好是白名单那三个
+  const declared = [...toolsCode.matchAll(/name:\s*TOOL_(\w+)/g)].map((m) => m[1])
+  if (declared.length === 3) {
+    ok('只声明了 3 个工具（' + declared.join(', ') + '）')
+  } else {
+    bad('声明的工具数不是 3 个，而是 ' + declared.length + '：' + declared.join(', '))
+  }
+
+  // 会话身份必须来自执行上下文，不得出现"当前会话"式兜底
+  if (/sessionIdFromExecution\(exec\)/.test(toolsCode)) {
+    ok('会话身份取自执行上下文（sessionIdFromExecution(exec)）')
+  } else {
+    bad('工具没有从执行上下文取会话身份 —— 会读到别的会话的图')
+  }
+  if (/currentSession|activeSession|ctx\.session\b|getCurrentSession/.test(toolsCode)) {
+    bad('工具里出现"当前会话"式访问 —— 红线 8 禁止（必须来自执行上下文）')
+  } else {
+    ok('工具里没有"当前会话"式访问（红线 8）')
+  }
 }
 
 // 2) 可执行入口里没有「一次成树 / 生成导图」类名字
