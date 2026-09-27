@@ -176,7 +176,10 @@ test('单击节点：选中它并把焦点移过去', () => {
   assert.deepEqual(s, { selectedIds: ['B'], focusId: 'B' })
 })
 
-test('框选：只改选中，**不动**焦点', () => {
+// ⚠️ `box-select` 这条：**UI 第一版不做多选**（主人拍板 2026-09-27）。
+// 这个测试保留的是「纯函数在收到 box-select 时的语义正确性」——
+// 函数形状为日后扩展保留，UI 不会产生这个动作。所以它是"形状保留"的回归测试，不是已启用功能。
+test('[保留形状] 框选：只改选中，**不动**焦点（UI 第一版不做多选）', () => {
   const s = applySelection(
     { selectedIds: ['A'], focusId: 'A' },
     { type: 'box-select', ids: ['X', 'Y', 'X'] },
