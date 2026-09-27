@@ -608,6 +608,67 @@ return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
 出现『禁止一键生成思维导图』字样」。所以 `verify-host` 的禁词扫描必须**剥掉 HELP_TEXT 块**
 再查，同时补一条**反向断言**：帮助正文里必须真的写上这句说明。
 
+### 3.18 真机发送实测（2026-09-27）—— **未完成**，如实记录
+
+**目标**：验证「宿主确实在真实请求上调用了 `agent/pre-step`」（卡 1 P4 / 卡 5 的最后一环）。
+343 条离线断言已经验死了注入的**内容**，剩下的只有"真的调了吗"。
+
+**结论：没有验证成功。** 下面把过程与卡点如实写下来，避免下一个人重走。
+
+#### 已经打通的部分
+
+| 项 | 状态 | 证据 |
+| --- | --- | --- |
+| 不经浏览器调宿主 RPC | ✅ 打通 | RPC 信封 = `POST /api/<ns>/<method>`，体 `{type:'client-request', rpcId, method:'<ns>/<method>', payload:{args:{…命名参数…}}}`；认证要先带 `?token=` 请求拿 **HttpOnly cookie**，再带上调 `/api`（无 cookie 一律 401） |
+| 布置「图」 | ✅ 打通 | `save` 写入焦点节点（含注解+正文）+ 粉线，`setPendingLinks` 同步 pending，rev 正常自增 |
+| 读出注入记录 | ✅ 工具就绪 | `scripts/live-inject-prep.mjs … read` 会打印 `injections` 与 `events` |
+| **消息确实发出去了** | ✅ 侧证 | 发送后目标会话文件被写：`~/.dsh/sessions/--E-FreeThought~0020Map--/session-7e84435a-…/session.v4.jsonl.zstd` 在 11:59:07 更新，体积 5032715 字节 |
+
+#### 卡在哪里
+
+**① 官方 composer 是 Lexical 编辑器，自动化输入/提交极难做对，且失败时是静默的。**
+
+依次试过（每次都是真实失败，不是推测）：
+
+| 尝试 | 结果 |
+| --- | --- |
+| `el.textContent = text` + `input` 事件 | 文字不进去（React 受控组件不认） |
+| `document.execCommand('insertText')` | 同上 |
+| CDP `Input.insertText` | 文字进去了，但**绕过 Lexical 的输入管线** → 它内部仍认为编辑器为空 |
+| `Input.dispatchKeyEvent` 的 `keyDown`(带 text) + `char` | 每个字符**插入两次**（`这这是是一一…`）—— Lexical 对两种事件都采纳 |
+| 只发 `char`（keyDown 不带 text） | ✅ 文字正确进入，且**发送按钮 `disabled=false`** |
+| `button.click()` | 输入框**不清空**、无任何事件 → React 的 onClick 没被合成 click 触发 |
+| 按几何坐标派发鼠标（mousePressed/Released） | 按钮中心被**它自己的 SVG 图标**盖住（`elementFromPoint` → `path`），点不到按钮 |
+| `focus()` 按钮 + 真实 Enter | 仍不清空 |
+| Shift+Tab 从 composer 跳到按钮 | 焦点跳到了「用量 40.5M tok」而不是发送按钮，说明 Tab 顺序与预期不同 |
+
+**② 更关键、也更需要下一步查清的矛盾**：
+
+消息**确实落盘了**（会话文件被写），但宿主侧的 `events` 端点**一条 `session/event` 都没有记录**。
+
+这意味着两种可能之一，我**没有查清是哪一种**：
+
+- (a) 我们的事件监听器没有真正收到 `session/event`（例如 scope 不对、或 `ctx.on` 在这个宿主上对会话事件的分发方式与我们读源码时的理解不同）；
+- (b) 消息虽然写进了会话文件，但并没有作为 canonical `user/message` 结算进入时间线（例如它还在排队、或这一轮没被接受）。
+
+**这一条必须先查清，否则「落链」这个核心功能在真机上是否工作都是未知的。**
+离线 27 条落链断言验的是纯函数，接线是否真的收到事件，此前从未在真机上确认过。
+
+#### 下一步该怎么做（建议）
+
+1. **先查 (a)/(b)**：在 `session/event` 监听器里加一行无条件日志（不管事件类型都记），
+   发一句话，看日志里到底有没有任何事件进来 —— 这能立刻区分 (a) 与 (b)。
+2. **不要再用自动化发送**。让主人在界面上手打一句话（成本极低，一句话的 token），
+   然后跑 `live-inject-prep.mjs … read`。自动化提交在 Lexical 上不值得继续投入。
+3. 若 (a) 成立 → 落链接线要重做（可能是注册方式问题）；
+   若 (b) 成立 → 检查这一轮为何没进时间线。
+
+#### 本轮**没有**改动的产品代码
+
+只新增了两个**探测/准备**脚本（`live-inject-prep.mjs`、`verify-inject-live.ps1`），
+产品代码（`src/`）一行未改。四个临时诊断脚本（会话结构侦察、发送诊断、通用探针运行器、
+自动发送器）用完已删。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
