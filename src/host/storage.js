@@ -28,17 +28,8 @@ import {
   planProjection,
   settlementKindOf,
 } from '../overlay/project.js'
-import {
-  buildSendSnapshot,
-  consumePending,
-  createPending,
-  makeGraphContextMessage,
-  pendingAdd,
-  pendingRemove,
-  rememberSnapshot,
-  renderSendInjection,
-  spliceInjectionAfterClaimed,
-} from '../overlay/links.js'
+import { createPending, pendingAdd, pendingRemove } from '../overlay/links.js'
+import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
 
 /**
  * 领域层与 json 后端实际强制执行的名称正则（`dsh-storage/lib/index.js:80`）：
@@ -310,6 +301,12 @@ const settlementLog = new SettlementLog(200)
 /** 每会话的「待注入粉线」集合（卡 5）。 */
 const pendingBySession = new Map()
 
+/**
+ * 每会话「最近一次注入用掉的快照 id」。
+ * 等对应的 `user/message` 真正落盘后再消费（规格 §10.3 第 2 条）。
+ */
+const injectedSnapshots = new Map()
+
 /** 注入诊断日志（卡 5）：记「哪一轮注入了什么」。 */
 const injectionLog = new SettlementLog(200)
 
@@ -495,9 +492,21 @@ export function apply(ctx) {
     () => {
       const onSessionEvent = (session, event) => {
         try {
+          const sessionId = sessionIdOf(session)
+
+          // 先处理「消费」：用户消息真正落盘后，把这一次注入用掉的粉线从 pending 移出
+          // （规格 §10.3 第 2 条）。放在投影之前，因为消费与投影是两件事。
+          if (sessionId && event && event.type === 'user/message') {
+            const used = injectedSnapshots.get(sessionId)
+            if (used && used.length) {
+              const cur = pendingBySession.get(sessionId) || createPending()
+              pendingBySession.set(sessionId, consumeInjectedSnapshot(cur, used))
+              injectedSnapshots.delete(sessionId)
+            }
+          }
+
           const kind = settlementKindOf(event)
           if (!kind) return // 不是 append 结算：stream 帧、工具过程、替换副本、失败尝试
-          const sessionId = sessionIdOf(session)
           if (!sessionId) {
             settlementLog.record('?', event, 'no-session-id')
             return
@@ -546,51 +555,37 @@ export function apply(ctx) {
       const onPreStep = async (payload, next) => {
         const decision = await next()
         try {
-          const agent = payload && payload.agent
-          const sessionId = sessionOfAgent(agent)
-          if (!sessionId) return decision
-          // 已 reject 的决策不要动（那是别人的判断）
+          // 决策逻辑全在 `computeInjection`（纯函数，可离线验死）。
+          // 这里只负责：取权威 doc、调它、记日志、把结果还给宿主。
           if (!decision || decision.kind !== 'enter') return decision
+          const sessionId = sessionOfAgent(payload && payload.agent)
+          if (!sessionId) return decision
 
-          const snapshotKey = sessionId + ':' + String(payload.turn) + ':' + String(payload.step)
-
-          // 拿到该会话的权威 overlay（读是同步的，但领域打开是异步的 → 用已就绪的句柄）
+          // 领域打开是异步的 → 用已就绪的句柄；没就绪就不注入，绝不挡这一轮对话
           const domain = await readyDomain(getDomain)
           if (!domain) return decision
           const doc = domain.table(TABLE).get(sessionId)
           if (!doc) return decision
 
-          const pending = pendingBySession.get(sessionId) || createPending()
-          const snapshot =
-            snapshotStore.get(snapshotKey) ||
-            rememberSnapshot(snapshotStore, snapshotKey, buildSendSnapshot(doc, pending, snapshotKey))
-
-          const rendered = renderSendInjection(doc, snapshot, {
+          const result = computeInjection({
+            decision,
+            payload: { ...payload, sessionId },
+            doc,
+            pending: pendingBySession.get(sessionId) || createPending(),
             derivedTitles: derivedTitleIndex(sessionId),
+            snapshotStore,
           })
-          if (!rendered.text) {
-            // 没有焦点也没有粉线 → 什么都不注入（绝不塞空消息）
-            injectionLog.record(sessionId, syntheticEvent(payload, 'skip'), 'empty')
-            return decision
-          }
 
-          const injected = makeGraphContextMessage(rendered.text, {
-            sendNonce: snapshot.sendNonce,
-            focusNodeId: rendered.focusNodeId,
-            linkCount: rendered.linkCount,
-          })
-          const messages = spliceInjectionAfterClaimed(
-            decision.messages,
-            payload.messages,
-            injected,
-          )
-          injectionLog.record(sessionId, syntheticEvent(payload, 'inject'), 'injected', {
-            text: rendered.text,
-            messageId: injected.id,
-            linkCount: rendered.linkCount,
-            skippedLinks: rendered.skippedLinks,
-          })
-          return { ...decision, messages }
+          if (result.status === INJECT_DONE) {
+            injectionLog.record(sessionId, syntheticEvent(payload, 'inject'), INJECT_DONE, result.meta)
+            // 记下这一次注入用的快照 id，等对应的 user/message 真正落盘后再消费。
+            // 不在这一刻消费：此刻消息还没被 canonical 接受（规格 §10.3：
+            // 「该用户消息被 canonical 接受后，消费」）。
+            injectedSnapshots.set(sessionId, result.snapshot.newPinkLinksAtSend || [])
+          } else {
+            injectionLog.record(sessionId, syntheticEvent(payload, 'skip'), result.status)
+          }
+          return result.decision
         } catch (e) {
           // 注入失败绝不能挡住这一轮对话 —— 记一条然后原样放行
           log(ctx, 'pre-step 注入失败（已放行原决策）：' + describeError(e))

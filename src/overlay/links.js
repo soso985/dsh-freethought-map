@@ -316,19 +316,23 @@ function deepFreeze(value) {
  *
  * @param {string} text 已渲染好的注入文本（见 renderSendInjection）
  * @param {{ sendNonce?: string, focusNodeId?: string | null, linkCount?: number }} meta
+ * @param {{ uuid?: () => string }} [deps] 注入 uuid 生成器（测试用）
  */
-export function makeGraphContextMessage(text, meta = {}) {
-  return makeInjectedUserMessage({
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: {
-      kind: 'freethought-map',
-      form: 'graph-context',
-      sendNonce: meta.sendNonce === undefined ? null : String(meta.sendNonce),
-      focusNodeId: meta.focusNodeId === undefined ? null : meta.focusNodeId,
-      linkCount: Number.isInteger(meta.linkCount) ? meta.linkCount : 0,
+export function makeGraphContextMessage(text, meta = {}, deps = {}) {
+  return makeInjectedUserMessage(
+    {
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: {
+        kind: 'freethought-map',
+        form: 'graph-context',
+        sendNonce: meta.sendNonce === undefined ? null : String(meta.sendNonce),
+        focusNodeId: meta.focusNodeId === undefined ? null : meta.focusNodeId,
+        linkCount: Number.isInteger(meta.linkCount) ? meta.linkCount : 0,
+      },
     },
-  })
+    deps,
+  )
 }
 
 /**

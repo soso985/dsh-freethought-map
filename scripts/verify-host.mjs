@@ -438,10 +438,18 @@ if (/await next\(\)/.test(hostSource)) {
 } else {
   bad('pre-step 里没有 await next() —— 会吞掉下游 listener 的决策')
 }
-if (/\{\s*\.\.\.decision,\s*messages\s*\}/.test(hostSource)) {
+// 决策逻辑在卡 5 被抽到 `src/overlay/inject.js`（纯函数），所以「展开 decision」这条
+// 要查那个文件；宿主侧只查「确实委托给了它」。
+const injectSource = readFileSync(join(root, 'src', 'overlay', 'inject.js'), 'utf8')
+if (/\{\s*\.\.\.decision,\s*messages\s*\}/.test(injectSource)) {
   ok('返回 { ...decision, messages } 而不是自造决策（保留 startsRequestSeries 等字段）')
 } else {
   bad('返回决策时没有展开 decision —— 会丢掉其他字段')
+}
+if (/computeInjection\(/.test(hostSource)) {
+  ok('宿主把注入决策委托给纯函数 computeInjection（可离线验死）')
+} else {
+  bad('宿主没有走 computeInjection —— 注入逻辑无法离线验证')
 }
 // 红线：注入不得唤醒模型 / 不得改写用户原文
 {
