@@ -44,7 +44,7 @@ import {
 import { createPending, pendingAdd, pendingRemove, buildDerivedTitleIndex } from '../overlay/links.js'
 import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
 import { registerReadonlyTools } from '../overlay/tools.js'
-import { appendProbeEntry, buildProbeEntry } from './hook-probe.js'
+import { classifyPreStep } from '../overlay/injection-marks.js'
 import {
   exportJson,
   exportMarkdown,
@@ -232,61 +232,6 @@ class FreethoughtMapHostService {
       serviceKey: SERVICE_KEY,
       namespace: SERVICE_KEY,
     })
-  }
-
-  /**
-   * 写入/合并派生标题（**只增不减**，与内部 `persistDerivedTitle` 同一形状）。
-   *
-   * 用途：
-   *   1. 验收 —— 不需要真实发送就能验证「持久化标题在重启后仍被读回」
-   *      （见 `scripts/live-verify-titles.mjs`）；
-   *   2. 日后「标题随导出/导入一起走」的接口基础。
-   *
-   * 合并语义与内部一致：已有的键**不覆盖**（标题是历史的，不该被后来的覆盖）。
-   *
-   * @param {string} sessionId
-   * @param {Record<string, string>} titles 形如 `{ [eventId]: 标题 }`
-   */
-  async importTitles(sessionId, titles) {
-    if (typeof sessionId !== 'string' || !sessionId) {
-      return { ok: false, error: 'sessionId 必须是非空字符串' }
-    }
-    if (!titles || typeof titles !== 'object' || Array.isArray(titles)) {
-      return { ok: false, error: 'titles 必须是以 eventId 为键的对象' }
-    }
-    for (const [k, v] of Object.entries(titles)) {
-      if (typeof k !== 'string' || !k) return { ok: false, error: 'title 的键必须是非空字符串' }
-      if (typeof v !== 'string' || !v) return { ok: false, error: 'title 的值必须是非空字符串（键 ' + k + '）' }
-    }
-    const domain = await readyDomain(this.getDomain)
-    if (!domain) return { ok: false, error: '存储领域尚未就绪' }
-
-    let added = 0
-    let kept = 0
-    try {
-      const table = domain.table(TITLES_TABLE)
-      const existing = table.get(sessionId)
-      const merged = existing && existing.titles ? { ...existing.titles } : {}
-      for (const [k, v] of Object.entries(titles)) {
-        if (merged[k] === undefined) {
-          merged[k] = v
-          added += 1
-        } else {
-          kept += 1 // 已有 → 保留原值（只增不减）
-        }
-      }
-      const record = { version: 1, sessionId, titles: merged }
-      // ⚠️ `update` 不会创建记录（记录不存在时抛 missing-key）—— 首建要用 `put`。
-      // 真机实测撞到过，见 `persistDerivedTitle` 的注释。
-      if (existing === undefined || existing === null) await table.put(sessionId, record)
-      else await table.update(sessionId, () => record)
-    } catch (e) {
-      return { ok: false, error: describeError(e) }
-    }
-    // 顺手刷新缓存，免得还要等下一次预热
-    await loadTitlesIntoCache(this.getDomain, sessionId, { force: true })
-    const cached = titlesCache.get(sessionId)
-    return { ok: true, added, kept, total: cached ? cached.size : 0 }
   }
 
   /**
@@ -620,7 +565,6 @@ markRemoteMethods(FreethoughtMapHostService, [
   'importDoc',
   'rebuild',
   'titles',
-  'importTitles',
 ])
 
 function describeError(e) {
@@ -678,7 +622,6 @@ export function buildRemoteContribution() {
       mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
       mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
       mk('titles', [remoteParam('sessionId')]),
-      mk('importTitles', [remoteParam('sessionId'), remoteParam('titles')]),
     ],
   }
 }
@@ -866,45 +809,41 @@ export function apply(ctx) {
   ctx.effect(
     () => {
       const onPreStep = async (payload, next) => {
-        // 探针：**每次调用都写一行**（含抛错的情形），用来回答
-        // 「宿主到底有没有调用 agent/pre-step」。写盘失败不影响对话。
-        const startedAt = Date.now()
-        let probeOutcome = 'unknown'
-        let probeSessionId = null
-        let probeInjection = null
-        let probeError = null
-        let originalDecision = null
-        let finalDecision = null
+        /**
+         * 这一次尝试的处置结果。
+         *
+         * 取值：`decision-not-enter` / `no-session-id` / `no-domain` / `no-doc`
+         *    或 `computeInjection` 的 status（`injected` / `empty` / `not-applicable`）。
+         * 它只用来写 `injectionLog` —— 也就是面板和 `injections` 端点给你看的那份记录。
+         */
+        let outcome = 'unknown'
+        /** @type {ReturnType<typeof classifyPreStep> | null} 本步的记账（判断是否需要注入）。 */
+        let preStepFacts = null
 
         const decision0 = await next()
-        originalDecision = decision0
         try {
           // 决策逻辑全在 `computeInjection`（纯函数，可离线验死）。
           // 这里只负责：取权威 doc、调它、记日志、把结果还给宿主。
           if (!decision0 || decision0.kind !== 'enter') {
-            probeOutcome = 'decision-not-enter'
-            finalDecision = decision0
+            outcome = 'decision-not-enter'
             return decision0
           }
+          preStepFacts = classifyPreStep({ payload, originalDecision: decision0 })
           const sessionId = sessionOfAgent(payload && payload.agent)
-          probeSessionId = sessionId
           if (!sessionId) {
-            probeOutcome = 'no-session-id'
-            finalDecision = decision0
+            outcome = 'no-session-id'
             return decision0
           }
 
           // 领域打开是异步的 → 用已就绪的句柄；没就绪就不注入，绝不挡这一轮对话
           const domain = await readyDomain(getDomain)
           if (!domain) {
-            probeOutcome = 'no-domain'
-            finalDecision = decision0
+            outcome = 'no-domain'
             return decision0
           }
           const doc = domain.table(TABLE).get(sessionId)
           if (!doc) {
-            probeOutcome = 'no-doc'
-            finalDecision = decision0
+            outcome = 'no-doc'
             return decision0
           }
           // 注入要用派生标题（节点名）→ 确保标题表已读回缓存。
@@ -920,8 +859,22 @@ export function apply(ctx) {
             derivedTitles: derivedTitleIndex(sessionId, doc),
             snapshotStore,
           })
-          probeOutcome = result.status
-          probeInjection = result.meta || null
+          outcome = result.status
+
+          // 记账：本步是"干净批次"（之前没有任何注入）吗？
+          // 这是「每步都注入是否重复」的判据本身 —— 真机实测为 true 且注入数 0，
+          // 所以每步注入是**必要的**（详见 `overlay/injection-marks.js`）。
+          if (preStepFacts && preStepFacts.needsInjection) {
+            log(
+              ctx,
+              'pre-step 注入（' +
+                (preStepFacts.turn === null ? '?' : preStepFacts.turn) +
+                '/' +
+                (preStepFacts.step === null ? '?' : preStepFacts.step) +
+                '）：' +
+                outcome,
+            )
+          }
 
           if (result.status === INJECT_DONE) {
             injectionLog.record(sessionId, syntheticEvent(payload, 'inject'), INJECT_DONE, result.meta)
@@ -932,29 +885,12 @@ export function apply(ctx) {
           } else {
             injectionLog.record(sessionId, syntheticEvent(payload, 'skip'), result.status)
           }
-          finalDecision = result.decision
           return result.decision
         } catch (e) {
           // 注入失败绝不能挡住这一轮对话 —— 记一条然后原样放行
-          probeError = describeError(e)
-          probeOutcome = 'error'
-          finalDecision = decision0
-          log(ctx, 'pre-step 注入失败（已放行原决策）：' + probeError)
+          outcome = 'error'
+          log(ctx, 'pre-step 注入失败（已放行原决策）：' + describeError(e))
           return decision0
-        } finally {
-          // 探针写在 finally 里：成功、跳过、抛错三种情形都会落一行
-          appendProbeEntry(
-            buildProbeEntry({
-              payload,
-              originalDecision,
-              finalDecision,
-              sessionId: probeSessionId,
-              outcome: probeOutcome,
-              injection: probeInjection,
-              durationMs: Date.now() - startedAt,
-              error: probeError,
-            }),
-          )
         }
       }
 
@@ -1230,6 +1166,17 @@ async function loadTitlesIntoCache(getDomain, sessionId, opts = {}) {
     if (!domain) return cached || null
     const record = domain.table(TITLES_TABLE).get(sessionId)
     const titles = record && record.titles ? record.titles : {}
+    // ⚠️ 磁盘上**没有**记录时，必须把缓存也清掉，而不是留着旧的。
+    //
+    // 为什么：缓存是「磁盘记录 + 本进程新增」的合并视图。如果记录被外部删掉
+    // （清理、导入回滚、用户手工删库…），而缓存还留着旧标题，
+    // 那下一次投影就会把旧标题**整份写回** —— 删掉的东西自己复活了。
+    // 这个坑真机撞到过：清掉一条测试标题，一次投影之后它又回来了。
+    if (!record) {
+      const fresh = new Map()
+      titlesCache.set(sessionId, fresh)
+      return fresh
+    }
     const merged = new Map(cached || [])
     for (const [k, v] of Object.entries(titles)) merged.set(k, v)
     titlesCache.set(sessionId, merged)

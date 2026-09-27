@@ -575,65 +575,62 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
   }
 }
 
-// ── 10. pre-step 钩子探针（临时诊断，2026-09-27）──────────────────────────────
+// ── 10. 「每步都注入是否重复」的判据（原探针，2026-09-27 收口）──────────────
 //
-// 探针不参与产品逻辑，但它必须**每次调用都写**（含跳过与抛错），
-// 否则就分不清「钩子没被调用」和「被调用了但没注入」。这几条断言锁住这个性质。
+// 历史：这里原先断言 `src/host/hook-probe.js`（一个只写 JSONL 的诊断探针）。
+// 它的使命已经完成（P0 修完 + 真机注入验完），按主人指示**删除**，
+// 因为它每次 pre-step 都写盘（运行代价 + 敏感文本落盘）。
+//
+// 但探针里有一条**真实有用**的东西被保留了下来：判断
+// 「这一步进来之前，消息批次里是不是已经带着我们上一步注入的那条」。
+// 它决定每步注入是必要还是重复 —— 现在搬到了 `overlay/injection-marks.js` 的
+// `classifyPreStep`（纯函数、可离线验死），并在 pre-step 里真的被调用。
 {
-  const probePath = join(root, 'src', 'host', 'hook-probe.js')
-  let probeSource = ''
+  const marksPath = join(root, 'src', 'overlay', 'injection-marks.js')
+  let marksSource = ''
   try {
-    probeSource = readFileSync(probePath, 'utf8')
+    marksSource = readFileSync(marksPath, 'utf8')
   } catch {
-    bad('找不到 src/host/hook-probe.js —— 探针被删了？')
+    bad('找不到 src/overlay/injection-marks.js —— 判据被误删了？')
   }
-  if (probeSource) {
-    if (/appendFileSync\(/.test(probeSource)) {
-      ok('探针用 appendFileSync **追加**写（保留历史，便于对比多次发送）')
-    } else {
-      bad('探针没有用追加写 —— 会覆盖掉上一次的记录')
-    }
-    if (/try\s*\{[\s\S]*appendFileSync[\s\S]*\}\s*catch/.test(probeSource)) {
-      ok('探针写盘包在 try/catch 里（写失败绝不影响对话）')
-    } else {
-      bad('探针写盘没有容错 —— 写失败会冒泡影响对话')
-    }
-    if (/export function buildProbeEntry\(/.test(probeSource)) {
-      ok('探针的记录构造是纯函数（可离线断言字段形状）')
-    } else {
-      bad('探针记录构造不是独立函数 —— 无法离线断言')
-    }
-    // 问题 B 相关：探针必须记录「这一步进来之前已有的注入条数」
-    // —— 只看 outcome=injected 分不清"每步都注入是必要还是重复"
-    if (/payloadInjected/.test(probeSource) && /decisionInjected/.test(probeSource)) {
-      ok('探针记录 payloadInjected / decisionInjected（用于判定"每步都注入"是否重复）')
-    } else {
-      bad('探针没有记录已有注入条数 —— 无法回答"同一步重复注入"这个问题')
-    }
-    if (/export function isInjectedMessage\(/.test(probeSource)) {
+  if (marksSource) {
+    if (/export function isInjectedMessage\(/.test(marksSource)) {
       ok('注入消息的识别走 source.kind/form（不按文本前缀 —— 那会被用户原文污染）')
     } else {
       bad('注入消息识别没有结构化判据')
     }
-
-    // 不该把注入正文全文写进日志（隐私 + 体积）
-    if (/textPreview/.test(probeSource) && !/text:\s*inj\.text\b/.test(probeSource)) {
-      ok('探针只写注入文本的**预览**，不写全文')
+    if (/export function classifyPreStep\(/.test(marksSource) && /payloadInjected/.test(marksSource) && /decisionInjected/.test(marksSource)) {
+      ok('classifyPreStep 记录 payloadInjected / decisionInjected（判定"每步都注入"是否重复）')
     } else {
-      bad('探针可能把注入正文全文写进日志 —— 应只写预览')
+      bad('classifyPreStep 没有记录已有注入条数 —— 无法回答"同一步重复注入"')
+    }
+    if (/needsInjection/.test(marksSource)) {
+      ok('判据给出明确结论字段 needsInjection（而不是让调用方自己推）')
+    } else {
+      bad('判据没有给出结论字段')
     }
   }
 
-  // 宿主侧：探针必须写在 finally 里（成功/跳过/抛错三种情形都落一行）
-  if (/finally\s*\{[\s\S]{0,400}appendProbeEntry\(/.test(hostSource)) {
-    ok('探针写在 pre-step 的 finally 里 —— 抛错时也会落一行')
-  } else {
-    bad('探针不在 finally 里 —— 抛错的那次调用不会被记录，会误判成"钩子没跑"')
+  // 探针必须真的被删掉（主人明确要求），且宿主不得再引用它
+  let probeStillThere = false
+  try {
+    readFileSync(join(root, 'src', 'host', 'hook-probe.js'), 'utf8')
+    probeStillThere = true
+  } catch {
+    probeStillThere = false
   }
-  if (/import\s*\{\s*appendProbeEntry,\s*buildProbeEntry\s*\}/.test(hostSource)) {
-    ok('宿主已接入探针')
+  if (!probeStillThere) ok('诊断探针 src/host/hook-probe.js 已删除（使命完成）')
+  else bad('探针还在 —— 它每次 pre-step 都写盘，属于已收口的诊断代码')
+  if (/hook-probe|appendProbeEntry|buildProbeEntry/.test(hostSource)) {
+    bad('宿主里仍有探针引用 —— 删了文件但没删接入点')
   } else {
-    bad('宿主没有接入探针')
+    ok('宿主里没有任何探针引用（接入点也清干净了）')
+  }
+  // 判据必须真的被 pre-step 调用（否则就变成死代码）
+  if (/classifyPreStep\(/.test(hostSource)) {
+    ok('pre-step 里真的调用了 classifyPreStep（不是只导出没人用）')
+  } else {
+    bad('classifyPreStep 导出了却没人调用 —— 那就是死代码，该删')
   }
 }
 
@@ -774,27 +771,16 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
     }
   }
 
-  // `importTitles` 是验收/导入用的写入口，也要区分首建与更新（同一个坑）
+  // ⚠️ 这里**不该**再有任何"测试专用写入口"。
+  // 早先有个 `importTitles` RPC 端点，但它只有验收脚本在调 ——
+  // 「只在测试里用、没有任何调用方开放」的写入口不该留在产品里（主人 2026-09-27 点名）。
+  // 验收改成直接驱动 `__test.persistDerivedTitle`（与投影同一条代码路径）。
   {
-    const start = hostSource.indexOf('async importTitles(')
-    const braceStart = hostSource.indexOf('{', start)
-    let depth = 0
-    let body = ''
-    for (let i = braceStart; i < hostSource.length; i += 1) {
-      const ch = hostSource[i]
-      if (ch === '{') depth += 1
-      else if (ch === '}') {
-        depth -= 1
-        if (depth === 0) {
-          body = hostSource.slice(braceStart, i + 1)
-          break
-        }
-      }
-    }
-    if (body && /table\.put\(/.test(body) && /table\.update\(/.test(body)) {
-      ok('importTitles 同样区分首建/更新')
+    const clientSource = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
+    if (/importTitles/.test(hostSource) || /importTitles/.test(clientSource)) {
+      bad('还有 `importTitles` 这个测试专用写入口 —— 产品里不该有它')
     } else {
-      bad('importTitles 没有区分首建/更新 —— 首次导入会失败')
+      ok('没有测试专用的标题写入口（验收直接驱动真函数）')
     }
   }
   if (/titlesCache/.test(hostSource) && /loadTitlesIntoCache\(/.test(hostSource)) {

@@ -23,6 +23,7 @@ import {
   computeInjection,
   consumeInjectedSnapshot,
 } from '../src/overlay/inject.js'
+import { classifyPreStep, countInjected, isInjectedMessage } from '../src/overlay/injection-marks.js'
 
 const results = []
 let passed = 0
@@ -426,6 +427,82 @@ test('注解优先于持久化标题（用户的注解永远赢）', () => {
   })
   assert.match(r.meta.text, /当前焦点：《我的注解》/)
   assert.doesNotMatch(r.meta.text, /原文/)
+})
+
+// ───── 「每步都注入是否重复」的判据（原探针保留下来的那部分）─────
+//
+// 真机结论（2026-09-27）：payloadInjected = 0 且 decisionInjected = 0
+// ⇒ 每个 step 都是全新批次 ⇒ 每步注入是**必要**的，不是重复。
+// 这几条把判据本身的行为锁住 —— 它现在是产品逻辑（pre-step 会调它），不再是诊断代码。
+
+const INJ_MARK = { kind: 'freethought-map', form: 'graph-context' }
+const injectedMsg = (id) => ({ id, role: 'user', content: [{ type: 'text', text: 'x' }], source: INJ_MARK })
+const userMsg = (id) => ({ id, role: 'user', content: [{ type: 'text', text: 'hi' }] })
+
+test('识别注入消息走 source.kind/form —— 不按文本前缀（前缀会被用户原文冒充）', () => {
+  assert.equal(isInjectedMessage(injectedMsg('m1')), true)
+  assert.equal(isInjectedMessage(userMsg('m2')), false)
+  // 用户自己打出前缀字样，也不算我们的注入
+  const fake = { id: 'm3', role: 'user', content: [{ type: 'text', text: '[用户图数据]\n当前焦点：《x》' }] }
+  assert.equal(isInjectedMessage(fake), false, '文本里有前缀不能被当成我们的注入')
+  assert.equal(isInjectedMessage(null), false)
+  assert.equal(countInjected([userMsg('a'), injectedMsg('b'), injectedMsg('c')]), 2)
+  assert.equal(countInjected(undefined), 0)
+})
+
+test('判据：payload/decision 里都没有注入 → needsInjection=true（本步是干净批次）', () => {
+  const f = classifyPreStep({
+    payload: { turn: 7, step: 1, messages: [userMsg('u1')] },
+    originalDecision: { kind: 'enter', messages: [userMsg('u1')] },
+  })
+  assert.equal(f.payloadInjected, 0)
+  assert.equal(f.decisionInjected, 0)
+  assert.equal(f.needsInjection, true, '干净批次必须注入，否则该步没有图上下文')
+  assert.equal(f.payloadMessages, 1)
+  assert.equal(f.turn, 7)
+  assert.equal(f.step, 1)
+})
+
+test('判据：上下文里已经带着我们的注入 → needsInjection=false（再插就是重复）', () => {
+  const f = classifyPreStep({
+    payload: { turn: 7, step: 2, messages: [userMsg('u1'), injectedMsg('i1')] },
+    originalDecision: { kind: 'enter', messages: [userMsg('u1'), injectedMsg('i1')] },
+  })
+  assert.equal(f.payloadInjected, 1)
+  assert.equal(f.decisionInjected, 1)
+  assert.equal(f.needsInjection, false, '已经有注入了，再来一条就是重复花 token')
+})
+
+test('判据：changedMessages 按 **id 序列**判（不是按长度或对象引用）', () => {
+  const before = [userMsg('u1')]
+  const afterInserted = [userMsg('u1'), injectedMsg('i1')]
+  const afterSameLengthButDifferent = [userMsg('u2')]
+
+  assert.equal(
+    classifyPreStep({ payload: {}, originalDecision: { kind: 'enter', messages: before }, finalDecision: { kind: 'enter', messages: afterInserted } }).changedMessages,
+    true,
+    '插了一条 → 变了',
+  )
+  assert.equal(
+    classifyPreStep({ payload: {}, originalDecision: { kind: 'enter', messages: before }, finalDecision: { kind: 'enter', messages: before } }).changedMessages,
+    false,
+    '一模一样 → 没变',
+  )
+  assert.equal(
+    classifyPreStep({ payload: {}, originalDecision: { kind: 'enter', messages: before }, finalDecision: { kind: 'enter', messages: afterSameLengthButDifferent } }).changedMessages,
+    true,
+    '**长度相同但内容不同也算变了**（这才是 id 序列判据的意义）',
+  )
+})
+
+test('判据：缺字段不抛错（pre-step 拿不到 decision 时也要安全）', () => {
+  const f = classifyPreStep({})
+  assert.equal(f.turn, null)
+  assert.equal(f.step, null)
+  assert.equal(f.payloadMessages, 0)
+  assert.equal(f.messagesBefore, null)
+  assert.equal(f.needsInjection, true)
+  assert.equal(classifyPreStep(null).needsInjection, true)
 })
 
 // ───────────────────────────── 报告 ─────────────────────────────

@@ -119,7 +119,6 @@ function buildRemoteContribution() {
       mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
       mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
       mk('titles', [remoteParam('sessionId')]),
-      mk('importTitles', [remoteParam('sessionId'), remoteParam('titles')]),
     ],
   }
 }
