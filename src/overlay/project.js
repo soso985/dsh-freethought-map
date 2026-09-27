@@ -219,7 +219,14 @@ function dropPositionFor(doc, parent) {
 }
 
 /** 本地派生标题（与 overlay/index.js 的 deriveTitle 同规则；这里独立一份以免循环依赖）。 */
-function deriveTitleFor(text, limit = 24) {
+/**
+ * 派生标题：原文首行 + 压空白 + 截断到 limit 字（超出加省略号）。
+ *
+ * 导出是为了让宿主在**持久化**派生标题时用同一份规则 ——
+ * 早先只在 `SettlementLog.record` 里内联用过它；一旦要在别处再算一次，
+ * 就必须共用这一个实现，否则截断规则会分叉。
+ */
+export function deriveTitleFor(text, limit = 24) {
   const firstLine = String(text || '')
     .split(/\r?\n/)[0]
     .replace(/\s+/g, ' ')

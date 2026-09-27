@@ -723,6 +723,48 @@ if (/from '\.\.\/overlay\/undo\.js'/.test(hostSource)) {
   }
 }
 
+// ── 12. 派生标题的持久化（2026-09-27：修「宿主重启后标题全失效」）──────────────
+//
+// 为什么必须有这一层：标题原先只活在内存的 SettlementLog 里，宿主一重启就全没了，
+// 注入文案与面板链行一起退化成「（未命名）」/「（无标题）」。
+// 而**不能**事后从会话补读 —— `Session` 的 eventAt/snapshotEvents/ownEvents
+// 全被 `@deprecated` 禁掉新调用（见 docs/HOST.md）。
+// 所以改成：投影那一刻把标题记进**独立的表**，重启后读回。
+{
+  if (/const TITLES_TABLE = 'derived_titles'/.test(hostSource)) {
+    ok("有独立的派生标题表 `derived_titles`（**不写 overlay 的 title 字段**，符合规格 §6.4）")
+  } else {
+    bad('没有独立的派生标题表')
+  }
+  if (/\[TITLES_TABLE\]: \{ valueSchema: titlesRecordSchema \}/.test(hostSource)) {
+    ok('派生标题表登记进了领域 spec（不是偷偷写别的表）')
+  } else {
+    bad('派生标题表没登记进领域 spec')
+  }
+  if (/function persistDerivedTitle\(/.test(hostSource) && /persistDerivedTitle\(domain, sessionId/.test(hostSource)) {
+    ok('投影时把派生标题持久化（projectOne 里调用）')
+  } else {
+    bad('投影时没有持久化派生标题 —— 重启后仍会全失效')
+  }
+  if (/titlesCache/.test(hostSource) && /loadTitlesIntoCache\(/.test(hostSource)) {
+    ok('有内存缓存 + 预热函数（derivedTitleIndex 是同步的，必须先异步灌一次）')
+  } else {
+    bad('没有标题缓存 —— 同步的 derivedTitleIndex 拿不到持久化数据')
+  }
+  // 关键：接上废弃 API 就是踩了禁条
+  if (/snapshotEvents\(|\.eventAt\(|\.ownEvents\(/.test(hostSource)) {
+    bad('宿主代码里出现了 @deprecated 的同步会话读接口（new calls are prohibited）')
+  } else {
+    ok('**没有**使用被废弃的会话读接口（eventAt / snapshotEvents / ownEvents）')
+  }
+  // 标题合并：持久化优先，日志兜底
+  if (/const cached = titlesCache\.get\(sessionId\)/.test(hostSource) && /settlementLog\.list\(sessionId/.test(hostSource)) {
+    ok('derivedTitleIndex 同时取「持久化标题」与「结算日志」，前者优先')
+  } else {
+    bad('derivedTitleIndex 没有合并两个来源')
+  }
+}
+
 // ── 报告 ────────────────────────────────────────────────────────────────────
 const fails = results.filter(([s]) => s === 'FAIL')
 const pad = Math.max(...results.map(([, m]) => m.length))

@@ -35,8 +35,11 @@ import {
   SettlementLog,
   applyProjection,
   backfill,
+  deriveTitleFor,
+  eventIdOf,
   planProjection,
   settlementKindOf,
+  textOf,
 } from '../overlay/project.js'
 import { createPending, pendingAdd, pendingRemove, buildDerivedTitleIndex } from '../overlay/links.js'
 import { INJECT_DONE, computeInjection, consumeInjectedSnapshot } from '../overlay/inject.js'
@@ -63,6 +66,24 @@ const UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/
 const DOMAIN_NAME = 'freethought_map'
 const DOMAIN_VERSION = 1
 const TABLE = 'overlays'
+/**
+ * 派生标题表（第二张表）。
+ *
+ * 为什么需要它：派生标题原先只活在**内存**的 `SettlementLog` 里，
+ * 宿主一重启，所有已有节点的标题就全失效 —— 注入给模型的焦点摘要退化成
+ * 「当前焦点：《（未命名）》」，面板链行退化成「（无标题）」。
+ *
+ * 为什么不能靠"事后读会话"补：`Session` 上的 `eventAt` / `snapshotEvents` / `ownEvents`
+ * **全部被标记 `@deprecated`**，注释原文「new calls are prohibited」，
+ * 而 `SessionStore` 上没有替代的读面。所以那条路是关的。
+ *
+ * 正解：我们**本来就实时收到每一个事件**（`session/event`），
+ * 所以在投影那一刻把派生标题**记下来并持久化**，重启后读回即可 —— 不碰废弃 API。
+ *
+ * 规格合规性：规格 §6.4 禁止的是「把派生标题写回 overlay 的 `title` 字段」
+ * （那是用户的注解字段）。这里是**独立的表**，与 overlay 无关，不违反那条。
+ */
+const TITLES_TABLE = 'derived_titles'
 const SERVICE_KEY = 'freethoughtMap'
 const PACKAGE_NAME = 'dsh-freethought-map'
 
@@ -93,6 +114,42 @@ const overlayRecordSchema = {
 }
 
 /**
+ * 派生标题表的记录 schema。
+ *
+ * 形状刻意极简：`{ version, sessionId, titles: { [eventId]: 标题 } }`。
+ * **只增不减**（`titles` 累积），所以没有 `rev`/并发问题 ——
+ * 每次写入都是「读回来 → 合并新标题 → 写回」，永远不会丢掉已记的。
+ */
+const titlesRecordSchema = {
+  parse(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('派生标题记录必须是对象')
+    }
+    if (!Number.isInteger(raw.version) || raw.version < 1) {
+      throw new Error('派生标题记录 version 必须是正整数')
+    }
+    if (typeof raw.sessionId !== 'string' || !raw.sessionId) {
+      throw new Error('派生标题记录 sessionId 必须是非空字符串')
+    }
+    if (!raw.titles || typeof raw.titles !== 'object' || Array.isArray(raw.titles)) {
+      throw new Error('派生标题记录 titles 必须是对象')
+    }
+    for (const [k, v] of Object.entries(raw.titles)) {
+      if (typeof k !== 'string' || !k) throw new Error('title 的键必须是非空字符串')
+      if (typeof v !== 'string') throw new Error('title 的值必须是字符串（键 ' + k + '）')
+    }
+    return raw
+  },
+  safeParse(raw) {
+    try {
+      return { success: true, data: this.parse(raw) }
+    } catch (e) {
+      return { success: false, error: e }
+    }
+  },
+}
+
+/**
  * 领域 spec。字段与 `defineDomain({name, version, tables})` 的产物一致；
  * `defineDomain` 在模块加载时做的那几条校验（名字正则、版本非负整数）这里自己复制一遍 ——
  * 代价是三行，换来「不依赖宿主能解析到任何包」。
@@ -100,13 +157,19 @@ const overlayRecordSchema = {
 function makeDomainSpec() {
   if (!UNIT_NAME_RE.test(DOMAIN_NAME)) throw new Error('非法领域名（须匹配 ' + UNIT_NAME_RE + '）：' + DOMAIN_NAME)
   if (!UNIT_NAME_RE.test(TABLE)) throw new Error('非法表名（须匹配 ' + UNIT_NAME_RE + '）：' + TABLE)
+  if (!UNIT_NAME_RE.test(TITLES_TABLE)) {
+    throw new Error('非法表名（须匹配 ' + UNIT_NAME_RE + '）：' + TITLES_TABLE)
+  }
   if (!Number.isInteger(DOMAIN_VERSION) || DOMAIN_VERSION < 0) {
     throw new Error('领域版本必须是非负整数')
   }
   return {
     name: DOMAIN_NAME,
     version: DOMAIN_VERSION,
-    tables: { [TABLE]: { valueSchema: overlayRecordSchema } },
+    tables: {
+      [TABLE]: { valueSchema: overlayRecordSchema },
+      [TITLES_TABLE]: { valueSchema: titlesRecordSchema },
+    },
   }
 }
 
@@ -169,6 +232,31 @@ class FreethoughtMapHostService {
       serviceKey: SERVICE_KEY,
       namespace: SERVICE_KEY,
     })
+  }
+
+  /**
+   * 读某个会话的**派生标题表**（`eventId → 派生标题`）。
+   *
+   * 也把结果灌进内存缓存（`titlesCache`），让同步调用的 `derivedTitleIndex` 能用上。
+   * 记录不存在时返回空表（**不建空记录** —— 没有标题的会话不该占一行存储）。
+   *
+   * @param {string} sessionId
+   */
+  async titles(sessionId) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { ok: false, error: 'sessionId 必须是非空字符串' }
+    }
+    const domain = await readyDomain(this.getDomain)
+    if (!domain) return { ok: false, error: '存储领域尚未就绪' }
+    let record = null
+    try {
+      record = domain.table(TITLES_TABLE).get(sessionId)
+    } catch (e) {
+      return { ok: false, error: describeError(e) }
+    }
+    const titles = record && record.titles ? record.titles : {}
+    titlesCache.set(sessionId, new Map(Object.entries(titles)))
+    return { ok: true, titles, count: Object.keys(titles).length }
   }
 
   /**
@@ -325,6 +413,10 @@ class FreethoughtMapHostService {
     const doc = domain.table(TABLE).get(sessionId)
     if (!doc) return { ok: false, error: '该会话还没有图' }
 
+    // 导出要用派生标题（Markdown 的显示名），先把标题表读回缓存。
+    // 不同步等太久：失败只是显示成「（未命名）」，不影响导出本身。
+    await loadTitlesIntoCache(this.getDomain, sessionId)
+
     if (kind === 'png') {
       return {
         ok: false,
@@ -425,6 +517,34 @@ const settlementLog = new SettlementLog(200)
 const pendingBySession = new Map()
 
 /**
+ * 派生标题的**内存缓存**：`sessionId → Map<eventId, 标题>`。
+ *
+ * 为什么需要缓存：`derivedTitleIndex` 是**同步**函数（被 `agent/pre-step` 同步调用），
+ * 而读持久化是异步的。所以启动/首次需要时先异步灌一次，之后读缓存。
+ *
+ * 数据是**只增**的，所以缓存不会有失效问题 —— 合并新标题即可。
+ */
+const titlesCache = new Map()
+
+/** 派生标题单条上限（与 `deriveTitleFor` 的默认 limit 一致）。 */
+const TITLE_LIMIT = 24
+
+/**
+ * 派生标题读写失败的告警**只记一次**。
+ *
+ * 为什么不用 `log(ctx, …)`：这两个函数在模块级被调用，拿不到 `ctx`，
+ * 而 `log()` 对 null ctx 是**静默丢弃** —— 那等于把失败藏起来。
+ * 但也不能每次都打：注入是热路径，坏了会刷屏。所以第一次用 console 打一条。
+ */
+let titleErrorLogged = false
+function warnTitleFailure(where, message) {
+  if (titleErrorLogged) return
+  titleErrorLogged = true
+  // eslint-disable-next-line no-console
+  console.warn('[freethought-map] 派生标题' + where + '失败（会退化为无标题，不影响落链与注入）：' + message)
+}
+
+/**
  * 每会话「最近一次注入用掉的快照 id」。
  * 等对应的 `user/message` 真正落盘后再消费（规格 §10.3 第 2 条）。
  */
@@ -444,6 +564,7 @@ markRemoteMethods(FreethoughtMapHostService, [
   'exportDoc',
   'importDoc',
   'rebuild',
+  'titles',
 ])
 
 function describeError(e) {
@@ -500,6 +621,7 @@ export function buildRemoteContribution() {
       mk('exportDoc', [remoteParam('sessionId'), remoteParam('kind')]),
       mk('importDoc', [remoteParam('sessionId'), remoteParam('json')]),
       mk('rebuild', [remoteParam('sessionId'), remoteParam('events')]),
+      mk('titles', [remoteParam('sessionId')]),
     ],
   }
 }
@@ -728,6 +850,10 @@ export function apply(ctx) {
             finalDecision = decision0
             return decision0
           }
+          // 注入要用派生标题（节点名）→ 确保标题表已读回缓存。
+          // 这里是**同步**函数里唯一能预热的地方：`derivedTitleIndex` 是同步的，
+          // 所以必须先把异步读做完。
+          await loadTitlesIntoCache(getDomain, sessionId)
 
           const result = computeInjection({
             decision: decision0,
@@ -812,6 +938,8 @@ export function apply(ctx) {
           }
           const doc = domain.table(TABLE).get(sessionId)
           lastDoc = doc === undefined ? null : doc
+          // 只读工具要显示节点名 → 先把该会话的标题表读回缓存
+          await loadTitlesIntoCache(getDomain, sessionId)
           return lastDoc
         },
         derivedTitles: (sessionId) => derivedTitleIndex(sessionId, lastDoc),
@@ -856,15 +984,30 @@ function sessionOfAgent(agent) {
  * 于是**永远查不中**，所有无注解的投影节点一律显示成 `（未命名）`。
  * 后果很实在：注入给模型的焦点摘要变成「当前焦点：《（未命名）》」—— 基本没用。
  *
+ * 第二个 bug（同一天）：标题只活在内存的 `SettlementLog` 里，**宿主一重启就全失效**。
+ * 现在标题有两个来源，按优先级取：
+ *   1. **持久化的标题表**（`derived_titles`，由 `projectOne` 在投影时记下）—— 重启后仍在
+ *   2. `SettlementLog`（本进程内见过的事件）—— 兜底，也为兼容老数据
+ *
  * 键的换算逻辑放在 `overlay/links.js` 的 `buildDerivedTitleIndex`（纯函数、可离线断言），
- * 这里只是把宿主的两份数据（结算日志 + 权威 doc）喂给它。
+ * 这里只是把三份数据（标题表缓存 + 结算日志 + 权威 doc）喂给它。
  *
  * @param {string} sessionId
  * @param {import('../overlay/index.js').OverlayDoc | null | undefined} doc
  * @returns {Record<string, string>} nodeId → 派生标题
  */
 function derivedTitleIndex(sessionId, doc) {
-  return buildDerivedTitleIndex(doc, settlementLog.list(sessionId, -1))
+  // 1) 持久化 + 本进程的标题，按 eventId 合并（持久化的优先，它是权威记录）
+  const byEvent = new Map()
+  for (const e of settlementLog.list(sessionId, -1)) {
+    if (e && e.eventId && e.title) byEvent.set(String(e.eventId), String(e.title))
+  }
+  const cached = titlesCache.get(sessionId)
+  if (cached) for (const [k, v] of cached) byEvent.set(String(k), String(v))
+
+  // 2) 交给纯函数按 node.id 建表
+  const entries = [...byEvent].map(([eventId, title]) => ({ eventId, title }))
+  return buildDerivedTitleIndex(doc, entries)
 }
 
 /** 给注入日志造一条「伪事件」，复用 SettlementLog 的字段形状。 */
@@ -908,6 +1051,24 @@ function sessionIdOf(session) {
 async function projectOne(ctx, getDomain, sessionId, event, kind) {
   const domain = await getDomain()
   const table = domain.table(TABLE)
+
+  // 先把该会话已持久化的派生标题读回缓存 —— 否则重启后旧节点全无标题，
+  // 注入文案会退化成「当前焦点：《（未命名）》」。
+  await loadTitlesIntoCache(getDomain, sessionId)
+
+  // 这一条事件的派生标题：**现在就记下来并持久化**。
+  // 不能指望以后从会话里补读（`Session` 的读接口全被 @deprecated 禁掉了），
+  // 而我们此刻正拿着完整事件 —— 这是唯一不碰废弃 API 的时机。
+  {
+    const eventId = eventIdOf(event)
+    const title = deriveTitleFor(textOf(event), TITLE_LIMIT)
+    if (eventId && title) {
+      const cached = titlesCache.get(sessionId) || new Map()
+      cached.set(String(eventId), title)
+      titlesCache.set(sessionId, cached)
+      persistDerivedTitle(domain, sessionId, String(eventId), title)
+    }
+  }
 
   let current = table.get(sessionId)
   if (current === undefined || current === null) {
@@ -985,6 +1146,70 @@ async function projectOne(ctx, getDomain, sessionId, event, kind) {
 function commitAuthorityWrite(before, after, changed) {
   if (!changed) return after
   return { ...after, rev: (Number(before && before.rev) || 0) + 1, updatedAt: Date.now() }
+}
+
+/**
+ * 把某个会话的派生标题**读回内存缓存**（幂等）。
+ *
+ * 什么时候调：
+ *   · `save` 之后（可能被清过缓存）
+ *   · `projectOne` 开头（投影要用标题显示节点名）
+ *   · `load` / `exportDoc` / 只读工具取完 doc 之后（它们都要算 `derivedTitleIndex`）
+ *
+ * 失败**不抛**：标题只是显示用，读不到最多退化成「（未命名）」，
+ * 绝不能让注入或落链因此失败。
+ *
+ * @param {() => Promise<any>} getDomain
+ * @param {string} sessionId
+ * @param {{force?: boolean}} [opts]
+ * @returns {Promise<Map<string,string> | null>}
+ */
+async function loadTitlesIntoCache(getDomain, sessionId, opts = {}) {
+  if (!sessionId) return null
+  const cached = titlesCache.get(sessionId)
+  if (cached && opts.force !== true) return cached
+  try {
+    const domain = await readyDomain(getDomain)
+    if (!domain) return cached || null
+    const record = domain.table(TITLES_TABLE).get(sessionId)
+    const titles = record && record.titles ? record.titles : {}
+    const merged = new Map(cached || [])
+    for (const [k, v] of Object.entries(titles)) merged.set(k, v)
+    titlesCache.set(sessionId, merged)
+    return merged
+  } catch (e) {
+    warnTitleFailure('读', describeError(e))
+    return cached || null
+  }
+}
+
+/**
+ * 把派生标题**持久化**（只增不减，合并写回）。
+ *
+ * 为什么在这里记而不是事后读会话：`Session` 的 `eventAt`/`snapshotEvents`/`ownEvents`
+ * **全部 `@deprecated`** 且「new calls are prohibited」，`SessionStore` 又没有替代读面。
+ * 而我们本来就实时收到每一个事件 —— 在投影那一刻记下来最省事，也不碰废弃 API。
+ *
+ * @param {any} domain 已打开的领域句柄
+ * @param {string} sessionId
+ * @param {string} eventId
+ * @param {string} title
+ */
+function persistDerivedTitle(domain, sessionId, eventId, title) {
+  if (!domain || !sessionId || !eventId || !title) return
+  try {
+    const table = domain.table(TITLES_TABLE)
+    const existing = table.get(sessionId)
+    const titles = existing && existing.titles ? { ...existing.titles } : {}
+    if (titles[eventId] === title) return // 没变化，别白写一次
+    titles[eventId] = title
+    // 走 update 的写链槽位（与别的写入串行），并且只增不减所以不怕覆盖
+    void table
+      .update(sessionId, () => ({ version: 1, sessionId, titles }))
+      .catch((e) => warnTitleFailure('写', describeError(e)))
+  } catch (e) {
+    warnTitleFailure('写', describeError(e))
+  }
 }
 
 /**
