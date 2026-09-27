@@ -576,6 +576,38 @@ return deepFreeze(structuredClone({ ...input, id: brandString(randomUUID()) }))
 **变异测试**：把 `redoInverseOf` 的 remove 分支故意打回原形，40 条断言立刻红 3 条；
 恢复后全绿。说明这些断言真的在咬。
 
+### 3.17 导入导出的合并语义与一处刻意的不做（卡 8）
+
+**导入的硬拒绝面**（`validateImport`）：version ≠ 1 / **`sessionId` 与当前会话不一致** /
+节点 id 与 key 不一致 / kind 非法 / position 非法 / turn 缺 sourceRef / 悬空父 / 自指 /
+成环 / 悬空粉线端点 / 自连 / 重复 link id / 超体积（nodes ≤ 5000、JSON ≤ 2MB）。
+
+**合并的四条**（规格 §11 原文 → 实现）：
+
+| 规格原文 | 实现 |
+| --- | --- |
+| manual、parentId、position、注解、hidden、粉线**采用文件** | 结构字段从文件搬过来 |
+| **不得**删除 canonical 仍需要且未在 hidden 中的投影 | 文件里没有的 turn 节点**原样保留** |
+| 同一 sourceRef 两边都有 → 结构字段以**导入文件**为准 | 用 `sourceRef` 对齐，搬结构字段但**沿用当前 overlay 的 id** |
+| （粉线）端点按 id 换算 | 对齐后 id 会变，粉线端点必须重映射 |
+
+**「重建投影」不写第二份算法**：它复用卡 3 的 `backfill`，只在外面套一层**事后核对** ——
+跑完逐项检查「没有覆盖已有 parentId/position/注解、没有复活 hidden」，有则报 `violations`。
+与其写第二份算法冒着分叉的风险，不如复用 + 验证。
+
+**一处刻意的不做**：`exportDoc('png')` **明确拒绝**并说明「需要画布，画布还没做」。
+理由：导出一张空的假图比不做更糟 —— 用户会以为图就是这样。
+同理，客户端 `collectWindowEvents` 目前返回 `null`（官方没有公开的"已加载窗口"读取接口，
+卡 1 的 P2 探针已证明），UI 如实说「重建已跳过，没有假装成功」。
+
+**帮助文本的编译与防漂移**：客户端 bundle 不能 import 相对模块，所以帮助正文由
+`scripts/build-help.mjs` **编译**进 bundle；`verify-io.mjs` 的断言把两边的字符串
+逐字比对，改了一边不改另一边会直接红。
+
+**禁词检查的正确边界**：卡 8 实施计划原文要求「检查**可执行入口**……**允许**文档/帮助
+出现『禁止一键生成思维导图』字样」。所以 `verify-host` 的禁词扫描必须**剥掉 HELP_TEXT 块**
+再查，同时补一条**反向断言**：帮助正文里必须真的写上这句说明。
+
 ---
 
 ## 4. 未决问题（卡 1 一并验证）
