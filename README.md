@@ -71,14 +71,22 @@ dsh-freethought-map/
 │   ├── 01-产品与技术规格.md      # overlay 类型、事件映射、存储协议、撤销、工具限额
 │   ├── 02-实施计划.md           # 卡 0–卡 8 任务卡与逐卡验收表
 │   ├── 03-粘贴给下一个AI的开场白.md
-│   └── HOST.md                 # ★ 宿主版本 + 五项扩展点探针记录（唯一取证处）
+│   ├── 04-画布计划.md           # ★ 画布对账：原型交互清单、硬约束、三方案、分阶段计划
+│   ├── 05-项目说明书.md         # ★ 本包说明书：目标/结构/入口/模块/栈/约束/验收/问题/下一步
+│   └── HOST.md                 # ★ 宿主版本 + 探针记录 + §3.1–3.17 逐卡技术结论（唯一取证处）
 ├── src/
-│   ├── host/      index.js     # 宿主一半（卡 1：仅加载证据；卡 2/3/6 加存储、订阅、工具）
-│   ├── client/    index.js     # 客户端一半（卡 1：探针壳；之后是画布）
-│   └── overlay/                # 纯函数：落链、补链、上提、防环、patch（不 import ctx）
-└── scripts/
-    └── verify-package.mjs      # 卡 0 静态验收脚本（清单/导出/ESM 语法/module id）
+│   ├── host/      index.js     # 宿主入口（22 行：inject 转发 + apply 转发）
+│   │              storage.js   # 权威存储 + 落链订阅 + 发送前注入 + 只读工具 + 9 个 RPC 端点
+│   ├── client/    index.js     # 客户端 bundle（单文件自包含普通脚本，不能 import/export）
+│   └── overlay/                # 纯函数层（8 个模块，不碰 ctx / 不碰 DOM，可离线验死）
+│       ├── index.js   project.js   locate.js   links.js
+│       └── inject.js  tools.js     undo.js     io.js
+└── scripts/                    # 11 套离线验收 + 2 套真宿主验收 + CDP 驱动
 ```
+
+**先读哪份**：想知道**这个包要做什么、现在缺什么** → [`docs/05-项目说明书.md`](docs/05-项目说明书.md)；
+想知道**画布怎么做** → [`docs/04-画布计划.md`](docs/04-画布计划.md)；
+想知道**某个技术结论是怎么测出来的** → [`docs/HOST.md`](docs/HOST.md)。
 
 ---
 
